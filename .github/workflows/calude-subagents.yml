@@ -1,0 +1,91 @@
+name: Claude Sub-agent Issue-to-PR Workflow
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  claude-issue-to-code:
+    if: github.event.label.name == 'claude-auto'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: 1. 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 2. 필수 시스템 도구 및 트리 설치
+        run: sudo apt-get install -y tree jq gettext-base
+
+      - name: 3. Claude Code CLI 설치
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: 4. 토큰 최적화 전역 변수 준비 (불필요 폴더 완전 제외)
+        id: prep
+        run: |
+          echo "ISSUE_BODY<<EOF" >> $GITHUB_ENV
+          echo "${{ github.event.issue.body }}" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+          # React와 FastAPI 가상환경 및 빌드 결과물을 트리에서 제외하여 토큰 절약
+          echo "FILE_TREE<<EOF" >> $GITHUB_ENV
+          tree -I 'node_modules|.git|dist|build|.venv|env|__pycache__|.pytest_cache' >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: 5. [Router Agent] 타겟 파일 탐색 (Haiku 활용)
+        id: router
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          envsubst < .github/prompts/1_router_agent.md > router_prompt.txt
+          ROUTER_RESULT=$(claude --model claude-3-haiku-20240307 --print "$(cat router_prompt.txt)")
+          
+          echo "TARGETS<<EOF" >> $GITHUB_ENV
+          echo "$ROUTER_RESULT" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: 6. 타겟 파일 본문 추출 (Worker 컨텍스트 조립)
+        run: |
+          TARGET_FILES=$(echo "$TARGETS" | jq -r '.target_files[]')
+          
+          CONTENT=""
+          for file in $TARGET_FILES; do
+            if [ -f "$file" ]; then
+              CONTENT+="--- $file ---\n"
+              CONTENT+="$(cat $file)\n\n"
+            fi
+          done
+          
+          echo "TARGET_FILES_CONTENT<<EOF" >> $GITHUB_ENV
+          echo -e "$CONTENT" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: 7. [Worker Agent] 코드 수정 실행 (Sonnet 활용)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          envsubst < .github/prompts/2_worker_agent.md > worker_prompt.txt
+          claude --model claude-3-5-sonnet-latest --execute "$(cat worker_prompt.txt)"
+
+      - name: 8. 브랜치 생성 및 PR 등록
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          BRANCH_NAME="claude-fix/issue-${{ github.event.issue.number }}"
+          git checkout -b $BRANCH_NAME
+          
+          git add .
+          git diff --staged --quiet || git commit -m "fix: Resolve full-stack issue #${{ github.event.issue.number }} via Claude Sub-agent"
+          git push origin $BRANCH_NAME
+          
+          gh pr create \
+            --title "🤖 Fix: Full-Stack Issue #${{ github.event.issue.number }} 자동 해결" \
+            --body "이 PR은 Claude Sub-agent 파이프라인에 의해 생성되었습니다.\n\n- **FastAPI/React 헌법 적용 완료**\n- Closes #${{ github.event.issue.number }}" \
+            --base main \
+            --head $BRANCH_NAME

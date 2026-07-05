@@ -1,0 +1,89 @@
+.backtest-page {
+  text-align: left;
+  padding: 24px;
+  max-width: 100%;
+}
+
+.backtest-form {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.backtest-error {
+  color: var(--chart-critical);
+}
+
+.backtest-section {
+  margin-top: 32px;
+}
+
+.backtest-section h2 {
+  text-align: left;
+  font-size: 18px;
+}
+
+.backtest-table-wrap {
+  overflow-x: auto;
+}
+
+.backtest-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.backtest-table th,
+.backtest-table td {
+  border-bottom: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.backtest-table th:first-child,
+.backtest-table td:first-child {
+  text-align: left;
+}
+
+.backtest-table td.side-long {
+  color: var(--chart-good);
+  font-weight: 600;
+}
+
+.backtest-table td.side-short {
+  color: var(--chart-critical);
+  font-weight: 600;
+}
+
+.backtest-table td.pnl-positive {
+  color: var(--chart-good);
+}
+
+.backtest-table td.pnl-negative {
+  color: var(--chart-critical);
+}
+
+.backtest-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+
+.backtest-summary-tile {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+}
+
+.backtest-summary-tile .label {
+  font-size: 12px;
+  color: var(--chart-muted);
+}
+
+.backtest-summary-tile .value {
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}

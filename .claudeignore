@@ -1,0 +1,11 @@
+# .claudeignore
+node_modules/
+dist/
+build/
+.venv/
+env/
+__pycache__/
+.pytest_cache/
+coverage/
+*.log
+*.sqlite3
