@@ -7,7 +7,9 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     app_name: str = "coin-autotrade-backend"
-    cors_origins: list[str] = ["http://localhost:5173"]
+    # Matches the Vite dev server on localhost, 127.0.0.1, or any private LAN IP,
+    # so the frontend also works when opened from another device on the network.
+    cors_origin_regex: str = r"^https?://(localhost|127\.0\.0\.1|(\d{1,3}\.){3}\d{1,3}):5173$"
 
     bingx_api_key: str = ""
     bingx_api_secret: str = ""
