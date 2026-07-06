@@ -1,4 +1,5 @@
 import { useState } from "react";
+import axios from "axios";
 import { CandleChart } from "../components/CandleChart";
 import { runBacktest } from "../api/backtest";
 import type { BacktestResult } from "../types/backtest";
@@ -15,26 +16,61 @@ function formatTime(value: string): string {
   return new Date(value).toLocaleString();
 }
 
+function isoDate(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+function defaultDateRange(): { start: string; end: string } {
+  const end = new Date();
+  const start = new Date(end.getTime() - 30 * 24 * 60 * 60 * 1000);
+  return { start: isoDate(start), end: isoDate(end) };
+}
+
+function extractErrorMessage(err: unknown): string {
+  if (axios.isAxiosError(err)) {
+    const detail = err.response?.data?.detail;
+    if (typeof detail === "string") return detail;
+    if (Array.isArray(detail)) {
+      return detail
+        .map((d) => `${Array.isArray(d.loc) ? d.loc.at(-1) : "error"}: ${d.msg}`)
+        .join(", ");
+    }
+    return err.message;
+  }
+  return err instanceof Error ? err.message : "Backtest failed";
+}
+
 export function BacktestPage() {
+  const { start: defaultStart, end: defaultEnd } = defaultDateRange();
   const [symbol, setSymbol] = useState("BTC-USDT");
-  const [startDate, setStartDate] = useState("");
-  const [endDate, setEndDate] = useState("");
+  const [startDate, setStartDate] = useState(defaultStart);
+  const [endDate, setEndDate] = useState(defaultEnd);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<BacktestResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   async function handleRun() {
     setError(null);
+
+    if (!symbol.trim() || !startDate || !endDate) {
+      setError("Please enter a symbol and both a start and end date.");
+      return;
+    }
+    if (startDate >= endDate) {
+      setError("Start date must be before end date.");
+      return;
+    }
+
     setLoading(true);
     try {
       const data = await runBacktest({
-        symbol,
+        symbol: symbol.trim(),
         start_date: startDate,
         end_date: endDate,
       });
       setResult(data);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Backtest failed");
+      setError(extractErrorMessage(err));
     } finally {
       setLoading(false);
     }
