@@ -35,6 +35,7 @@ _KLINES_PATH = "/openApi/swap/v3/quote/klines"
 _MAX_LIMIT = 1440
 _SOURCE_HEADER = {"X-SOURCE-KEY": "BX-AI-SKILL"}
 _INTERVAL_MS = {
+    Timeframe.LTF_1M: 60 * 1000,
     Timeframe.LTF_1H: 60 * 60 * 1000,
     Timeframe.HTF_4H: 4 * 60 * 60 * 1000,
 }

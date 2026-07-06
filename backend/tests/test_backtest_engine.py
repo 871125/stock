@@ -112,6 +112,127 @@ def test_open_trend_trade_skipped_on_liquidation_risk() -> None:
     assert trade is None
 
 
+# ---- pending 1m-entry setup ---------------------------------------------------------------
+
+
+def test_setup_matches_trend() -> None:
+    long_setup = be._build_pending_setup(PositionSide.LONG, 100, 120)
+    short_setup = be._build_pending_setup(PositionSide.SHORT, 120, 100)
+
+    assert be._setup_matches_trend(long_setup, TrendState.UPTREND) is True
+    assert be._setup_matches_trend(long_setup, TrendState.DOWNTREND) is False
+    assert be._setup_matches_trend(long_setup, TrendState.CONSOLIDATION) is False
+    assert be._setup_matches_trend(short_setup, TrendState.DOWNTREND) is True
+    assert be._setup_matches_trend(short_setup, TrendState.UPTREND) is False
+
+
+def test_build_pending_setup_computes_stop_loss() -> None:
+    long_setup = be._build_pending_setup(PositionSide.LONG, 100, 120)
+    assert long_setup.stop_loss == pytest.approx(100 * 0.999)
+
+    short_setup = be._build_pending_setup(PositionSide.SHORT, 100, 80)
+    assert short_setup.stop_loss == pytest.approx(100 * 1.001)
+
+
+def test_pending_setup_invalidated_on_body_close_past_stop_loss() -> None:
+    long_setup = be._build_pending_setup(PositionSide.LONG, 100, 120)
+
+    still_valid = make_candle(1, 101, 102, 99, 100.5)
+    assert be._pending_setup_invalidated(long_setup, still_valid) is False
+
+    invalidated = make_candle(2, 100, 101, 95, 98)
+    assert be._pending_setup_invalidated(long_setup, invalidated) is True
+
+
+def test_find_1m_reversal_entry_long_skips_non_reversal_candles() -> None:
+    candles = [
+        make_candle(0, 101.0, 101.2, 99.5, 100.5),  # touches zone (100) but bearish close
+        make_candle(1, 102.0, 103.0, 101.5, 102.8),  # bullish close but never touches zone
+        make_candle(2, 99.5, 100.9, 99.4, 100.8),  # touches zone (100) and closes bullish
+    ]
+
+    entry = be._find_1m_reversal_entry(PositionSide.LONG, 100, candles)
+
+    assert entry == (100.8, candles[2].timestamp)
+
+
+def test_find_1m_reversal_entry_short_requires_bearish_close_at_zone() -> None:
+    candles = [
+        make_candle(0, 99.5, 100.5, 99.0, 100.2),  # touches zone but bullish close
+        make_candle(1, 100.3, 100.8, 100.1, 99.9),  # bearish close, touches zone (100)
+    ]
+
+    entry = be._find_1m_reversal_entry(PositionSide.SHORT, 100, candles)
+
+    assert entry == (99.9, candles[1].timestamp)
+
+
+def test_find_1m_reversal_entry_returns_none_when_no_candle_qualifies() -> None:
+    candles = [make_candle(0, 105, 106, 104, 105.5)]  # never touches zone at 100
+    assert be._find_1m_reversal_entry(PositionSide.LONG, 100, candles) is None
+
+
+async def test_try_fill_pending_setup_skips_fetch_when_zone_not_touched() -> None:
+    setup = be._build_pending_setup(PositionSide.LONG, 100, 120)
+    candle = make_candle(1, 105, 106, 103, 104)  # low=103, never reaches zone (100)
+
+    calls: list[tuple] = []
+
+    async def fetch_1m(start, end) -> list[Candle]:
+        calls.append((start, end))
+        return []
+
+    opened = await be._try_fill_pending_setup(setup, candle, fetch_1m, 10_000, SETTINGS)
+
+    assert opened is None
+    assert calls == []
+
+
+async def test_try_fill_pending_setup_enters_on_1m_reversal() -> None:
+    setup = be._build_pending_setup(PositionSide.LONG, 100, 120)
+    candle = make_candle(1, 102, 103, 99, 101)  # wicks into the zone
+
+    reversal_time = candle.timestamp + timedelta(minutes=1)
+    one_minute_candles = [
+        Candle(timestamp=candle.timestamp, open=100.2, high=100.3, low=99.6, close=99.8, volume=1),
+        Candle(timestamp=reversal_time, open=99.8, high=100.9, low=99.7, close=100.7, volume=1),
+    ]
+
+    async def fetch_1m(start, end) -> list[Candle]:
+        assert start == candle.timestamp
+        assert end == candle.timestamp + timedelta(hours=1)
+        return one_minute_candles
+
+    opened = await be._try_fill_pending_setup(setup, candle, fetch_1m, 10_000, SETTINGS)
+
+    assert opened is not None
+    assert opened.entry_price == 100.7
+    assert opened.entry_time == reversal_time
+    assert opened.stop_loss == pytest.approx(100 * 0.999)
+    assert opened.take_profit == 120
+
+
+async def test_try_fill_pending_setup_returns_none_when_no_reversal_in_window() -> None:
+    setup = be._build_pending_setup(PositionSide.LONG, 100, 120)
+    candle = make_candle(1, 102, 103, 99, 101)
+
+    async def fetch_1m(start, end) -> list[Candle]:
+        return [
+            Candle(
+                timestamp=candle.timestamp,
+                open=100.5,
+                high=100.6,
+                low=99.5,
+                close=99.9,
+                volume=1,
+            )
+        ]
+
+    opened = await be._try_fill_pending_setup(setup, candle, fetch_1m, 10_000, SETTINGS)
+
+    assert opened is None
+
+
 # ---- _advance_trend_trade -----------------------------------------------------------------
 
 
@@ -365,19 +486,22 @@ def _uptrend_htf_candles() -> list[Candle]:
 
 
 def _uptrend_ltf_candles() -> list[Candle]:
-    # Starts after the HTF uptrend is confirmed (hour 76). Forms one LTF swing low at
-    # hour 79 (confirmed at hour 81 with LTF_PIVOT_LOOKBACK=2), then rallies to the HTF
-    # take-profit target (133) by hour 85.
+    # Starts after the HTF uptrend is confirmed (hour 76). Forms one LTF swing low ("OB")
+    # at hour 79 (confirmed at hour 81 with LTF_PIVOT_LOOKBACK=2). Price then pulls back to
+    # retouch that OB zone (103) at hour 83 -- that's where the 1m reversal-close entry
+    # fires (see the fetch_1m stub in the test) -- before rallying to the HTF take-profit
+    # target (134) by hour 86.
     rows = [
         (77, 109, 111, 109, 110),
         (78, 106, 108, 106, 107),
         (79, 103, 105, 103, 104),  # swing low candidate, low=103
         (80, 105, 107, 105, 106),
-        (81, 108, 110, 108, 109.5),  # confirmation bar -> entry at close
-        (82, 109, 115, 108, 114),
-        (83, 114, 122, 113, 121),
-        (84, 122, 130, 120, 129),
-        (85, 130, 135, 128, 134),  # high >= 133 -> take profit
+        (81, 108, 110, 108, 109.5),  # confirmation bar; zone not touched yet (low=108)
+        (82, 109, 112, 108, 111),  # still no touch
+        (83, 110, 111, 103, 110.5),  # low=103 retouches the OB zone -> 1m fetch triggers
+        (84, 112, 120, 111, 119),
+        (85, 120, 128, 119, 127),
+        (86, 128, 136, 127, 134),  # high >= 134 -> take profit
     ]
     return [
         Candle(
@@ -392,12 +516,47 @@ def _uptrend_ltf_candles() -> list[Candle]:
     ]
 
 
-def test_simulate_full_uptrend_long_trade_hits_take_profit() -> None:
+async def test_simulate_full_uptrend_long_trade_hits_take_profit() -> None:
     htf_candles = _uptrend_htf_candles()
     ltf_candles = _uptrend_ltf_candles()
     initial_equity = 10_000.0
 
-    result = be.simulate("BTC-USDT", htf_candles, ltf_candles, initial_equity)
+    zone_touch_candle = ltf_candles[6]  # hour 83, the OB retouch
+    assert zone_touch_candle.timestamp == BASE_TIME + timedelta(hours=83)
+    reversal_time = zone_touch_candle.timestamp + timedelta(minutes=1)
+    one_minute_candles = [
+        # First minute: touches the zone but closes bearish -> not yet a reversal.
+        Candle(
+            timestamp=zone_touch_candle.timestamp,
+            open=103.5,
+            high=103.6,
+            low=102.8,
+            close=103.0,
+            volume=1.0,
+        ),
+        # Second minute: touches the zone and closes bullish -> reversal entry.
+        Candle(
+            timestamp=reversal_time,
+            open=103.0,
+            high=103.9,
+            low=102.9,
+            close=103.8,
+            volume=1.0,
+        ),
+    ]
+
+    fetch_calls: list[tuple] = []
+
+    async def fetch_1m(start, end) -> list[Candle]:
+        fetch_calls.append((start, end))
+        return one_minute_candles
+
+    result = await be.simulate("BTC-USDT", htf_candles, ltf_candles, initial_equity, fetch_1m)
+
+    # fetch_1m is only called once: when the OB zone is actually retouched (hour 83).
+    assert fetch_calls == [
+        (zone_touch_candle.timestamp, zone_touch_candle.timestamp + timedelta(hours=1))
+    ]
 
     # Pivot prices are the candle's actual high/low, one above/below the zigzag "level".
     assert [(p.type, p.price) for p in result.htf_pivots] == [
@@ -411,7 +570,7 @@ def test_simulate_full_uptrend_long_trade_hits_take_profit() -> None:
     assert len(result.positions) == 1
     position = result.positions[0]
 
-    entry_price = 109.5
+    entry_price = 103.8
     stop_loss = 103 * 0.999
     take_profit = 134  # most recent confirmed HTF swing high
     sizing = calculate_position_size(
@@ -427,12 +586,13 @@ def test_simulate_full_uptrend_long_trade_hits_take_profit() -> None:
     assert position.side == PositionSide.LONG
     assert position.sequence_no == 1
     assert position.entry_price == entry_price
+    assert position.entry_time == reversal_time
     assert position.stop_loss == pytest.approx(stop_loss)
     assert position.take_profit == take_profit
     assert position.quantity == pytest.approx(sizing.quantity)
     assert position.pnl == pytest.approx(expected_pnl)
     assert position.is_win is True
-    assert position.exit_time == BASE_TIME + timedelta(hours=85)
+    assert position.exit_time == BASE_TIME + timedelta(hours=86)
 
     assert result.summary.total_trades == 1
     assert result.summary.win_count == 1

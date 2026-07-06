@@ -1,22 +1,42 @@
 """Backtest orchestration: MTF pivot detection, trend classification,
 entry/SL/TP resolution (spec sections 3-4), and position sizing (spec 5).
 
+Trend-trade entries are further refined with a 1-minute timing layer: once
+the LTF (1h) pivot ("OB") that would normally trigger an immediate entry is
+confirmed, the engine instead waits for price to return to that pivot's
+price (the OB zone) and looks inside that hour's 1-minute candles for a
+reversal-close confirmation before entering. SL/TP are unaffected -- they're
+still derived from the 1h pivot / 4h swing exactly as before; only the entry
+price and timestamp become 1m-precise.
+
 Simplifications (documented, not covered by the spec text):
 - HTF pivots are detected once over the full fetched history and treated as
   "known" starting `HTF_PIVOT_LOOKBACK` candles after they occur (same for
   LTF). A live bot would track unconfirmed pivots incrementally (spec 6.2);
   this backtester recomputes over the full range instead.
-- At most one position is open at a time.
+- At most one position (or one pending 1m-entry setup) is open at a time.
 - Trend-trade SL/TP are resolved against candle wicks (high/low); box-trade
   SL is resolved against the candle body close, per spec 4.3.
 - On a bar where both SL and TP are touched, SL is assumed to trigger first
   (conservative).
 - If a position is still open at the end of the requested range, it is
   force-closed at the last candle's close so it's reflected in the summary.
+- A pending setup that touches its zone but gets no 1m reversal-close within
+  that hour keeps waiting on subsequent hours, until either it fills, the 1h
+  candle closes past the (precomputed) stop-loss, or the HTF trend context
+  no longer supports it.
+- BingX only retains 1-minute klines for roughly the past year (verified
+  live: 365 days back returns data, 730 days back returns none). For
+  backtest ranges older than that, `fetch_1m` returns an empty list for
+  every zone touch, so trend-trade setups never fill -- only the RSI box
+  strategy (unaffected by this feature) can still produce trades that far
+  back.
 """
 
+import asyncio
 import bisect
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -49,6 +69,8 @@ RSI_OVERBOUGHT = 70.0
 BOX_PROXIMITY_PCT = 0.005
 TP1_CLOSE_FRACTION = 0.5
 
+Fetch1mCandles = Callable[[datetime, datetime], Awaitable[list[Candle]]]
+
 
 @dataclass
 class _TrendWindow:
@@ -56,6 +78,17 @@ class _TrendWindow:
     trend: TrendState
     recent_sl_price: float
     recent_sh_price: float
+
+
+@dataclass
+class _PendingSetup:
+    """An LTF pivot ("OB") confirmed in the trend direction, awaiting a 1m
+    reversal-close entry once price returns to the pivot's price."""
+
+    side: PositionSide
+    pivot_price: float
+    tp_price: float
+    stop_loss: float
 
 
 @dataclass
@@ -88,14 +121,21 @@ async def run_backtest(
         request.symbol, Timeframe.LTF_1H, request.start_date, request.end_date
     )
 
-    return simulate(request.symbol, htf_candles, ltf_candles, request.initial_equity)
+    async def fetch_1m(start: datetime, end: datetime) -> list[Candle]:
+        await asyncio.sleep(1.1)  # separate request; stay under the 1 req/s rate limit
+        return await client.get_ohlcv(request.symbol, Timeframe.LTF_1M, start, end)
+
+    return await simulate(
+        request.symbol, htf_candles, ltf_candles, request.initial_equity, fetch_1m
+    )
 
 
-def simulate(
+async def simulate(
     symbol: str,
     htf_candles: list[Candle],
     ltf_candles: list[Candle],
     initial_equity: float,
+    fetch_1m: Fetch1mCandles,
 ) -> BacktestResult:
     settings = get_settings()
 
@@ -118,6 +158,7 @@ def simulate(
     positions: list[Position] = []
     next_sequence_no = 1
     open_trade: _OpenTrade | None = None
+    pending_setup: _PendingSetup | None = None
 
     for i, candle in enumerate(ltf_candles):
         if open_trade is not None:
@@ -130,40 +171,42 @@ def simulate(
 
         window = _trend_window_at(trend_windows, trend_timestamps, candle.timestamp)
         if window is None:
+            pending_setup = None
             continue
+
+        if pending_setup is not None and not _setup_matches_trend(pending_setup, window.trend):
+            pending_setup = None
 
         opened: _OpenTrade | None = None
 
-        if window.trend == TrendState.UPTREND:
-            for pivot in confirmed_at.get(i, []):
-                if pivot.type == PivotType.SWING_LOW:
-                    opened = _try_open_trend_trade(
-                        side=PositionSide.LONG,
-                        entry_price=candle.close,
-                        pivot_price=pivot.price,
-                        tp_price=window.recent_sh_price,
-                        entry_time=candle.timestamp,
-                        equity=equity,
-                        settings=settings,
-                    )
-                    break
-        elif window.trend == TrendState.DOWNTREND:
-            for pivot in confirmed_at.get(i, []):
-                if pivot.type == PivotType.SWING_HIGH:
-                    opened = _try_open_trend_trade(
-                        side=PositionSide.SHORT,
-                        entry_price=candle.close,
-                        pivot_price=pivot.price,
-                        tp_price=window.recent_sl_price,
-                        entry_time=candle.timestamp,
-                        equity=equity,
-                        settings=settings,
-                    )
-                    break
-        elif i > 0:
-            opened = _try_open_box_trade_on_rsi_signal(
-                candle, rsi_values[i - 1], rsi_values[i], window, equity, settings
+        if pending_setup is None:
+            if window.trend == TrendState.UPTREND:
+                for pivot in confirmed_at.get(i, []):
+                    if pivot.type == PivotType.SWING_LOW:
+                        pending_setup = _build_pending_setup(
+                            PositionSide.LONG, pivot.price, window.recent_sh_price
+                        )
+                        break
+            elif window.trend == TrendState.DOWNTREND:
+                for pivot in confirmed_at.get(i, []):
+                    if pivot.type == PivotType.SWING_HIGH:
+                        pending_setup = _build_pending_setup(
+                            PositionSide.SHORT, pivot.price, window.recent_sl_price
+                        )
+                        break
+            elif i > 0:
+                opened = _try_open_box_trade_on_rsi_signal(
+                    candle, rsi_values[i - 1], rsi_values[i], window, equity, settings
+                )
+
+        if pending_setup is not None:
+            opened = await _try_fill_pending_setup(
+                pending_setup, candle, fetch_1m, equity, settings
             )
+            if opened is not None:
+                pending_setup = None
+            elif _pending_setup_invalidated(pending_setup, candle):
+                pending_setup = None
 
         if opened is not None:
             opened.sequence_no = next_sequence_no
@@ -223,6 +266,81 @@ def _trend_window_at(
     return windows[idx]
 
 
+def _trend_stop_loss(side: PositionSide, pivot_price: float) -> float:
+    if side == PositionSide.LONG:
+        return pivot_price * (1 - SL_BUFFER_PCT)
+    return pivot_price * (1 + SL_BUFFER_PCT)
+
+
+def _setup_matches_trend(setup: _PendingSetup, trend: TrendState) -> bool:
+    if setup.side == PositionSide.LONG:
+        return trend == TrendState.UPTREND
+    return trend == TrendState.DOWNTREND
+
+
+def _build_pending_setup(side: PositionSide, pivot_price: float, tp_price: float) -> _PendingSetup:
+    return _PendingSetup(
+        side=side,
+        pivot_price=pivot_price,
+        tp_price=tp_price,
+        stop_loss=_trend_stop_loss(side, pivot_price),
+    )
+
+
+def _pending_setup_invalidated(setup: _PendingSetup, candle: Candle) -> bool:
+    if setup.side == PositionSide.LONG:
+        return candle.close < setup.stop_loss
+    return candle.close > setup.stop_loss
+
+
+async def _try_fill_pending_setup(
+    setup: _PendingSetup,
+    candle: Candle,
+    fetch_1m: Fetch1mCandles,
+    equity: float,
+    settings: Settings,
+) -> _OpenTrade | None:
+    touched_zone = (
+        candle.low <= setup.pivot_price
+        if setup.side == PositionSide.LONG
+        else candle.high >= setup.pivot_price
+    )
+    if not touched_zone:
+        return None
+
+    one_minute_candles = await fetch_1m(candle.timestamp, candle.timestamp + timedelta(hours=1))
+    entry = _find_1m_reversal_entry(setup.side, setup.pivot_price, one_minute_candles)
+    if entry is None:
+        return None
+
+    entry_price, entry_time = entry
+    return _try_open_trend_trade(
+        side=setup.side,
+        entry_price=entry_price,
+        pivot_price=setup.pivot_price,
+        tp_price=setup.tp_price,
+        entry_time=entry_time,
+        equity=equity,
+        settings=settings,
+    )
+
+
+def _find_1m_reversal_entry(
+    side: PositionSide, zone_price: float, one_minute_candles: list[Candle]
+) -> tuple[float, datetime] | None:
+    """First 1m candle that touches the OB zone and closes back in the trade direction."""
+    for candle in one_minute_candles:
+        if side == PositionSide.LONG:
+            touched_zone = candle.low <= zone_price
+            reversal_close = candle.close > candle.open
+        else:
+            touched_zone = candle.high >= zone_price
+            reversal_close = candle.close < candle.open
+        if touched_zone and reversal_close:
+            return candle.close, candle.timestamp
+    return None
+
+
 def _try_open_trend_trade(
     side: PositionSide,
     entry_price: float,
@@ -232,12 +350,11 @@ def _try_open_trend_trade(
     equity: float,
     settings: Settings,
 ) -> _OpenTrade | None:
+    stop_loss = _trend_stop_loss(side, pivot_price)
     if side == PositionSide.LONG:
-        stop_loss = pivot_price * (1 - SL_BUFFER_PCT)
         if not (stop_loss < entry_price < tp_price):
             return None
     else:
-        stop_loss = pivot_price * (1 + SL_BUFFER_PCT)
         if not (tp_price < entry_price < stop_loss):
             return None
 

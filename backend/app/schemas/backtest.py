@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 class Timeframe(StrEnum):
     HTF_4H = "4h"
     LTF_1H = "1h"
+    LTF_1M = "1m"
 
 
 class PivotType(StrEnum):

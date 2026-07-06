@@ -1,4 +1,4 @@
-export type Timeframe = "4h" | "1h";
+export type Timeframe = "4h" | "1h" | "1m";
 export type PivotType = "SH" | "SL";
 export type TrendState = "uptrend" | "downtrend" | "consolidation";
 export type PositionSide = "long" | "short";
