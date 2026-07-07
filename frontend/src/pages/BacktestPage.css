@@ -16,6 +16,34 @@
   color: var(--chart-critical);
 }
 
+.backtest-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.backtest-progress-track {
+  flex: 1;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.backtest-progress-bar {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 4px;
+  transition: width 0.3s ease;
+}
+
+.backtest-progress-label {
+  font-size: 13px;
+  color: var(--chart-muted);
+  white-space: nowrap;
+}
+
 .backtest-section {
   margin-top: 32px;
 }

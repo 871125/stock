@@ -638,3 +638,61 @@ async def test_run_backtest_fetches_htf_with_buffer_and_ltf_with_exact_range() -
     assert result.positions == []
     assert result.summary.total_trades == 0
     assert result.summary.final_equity == 5_000
+
+
+# ---- progress reporting ---------------------------------------------------------------------
+
+
+async def test_run_backtest_reports_fetch_phases_and_completion() -> None:
+    from app.schemas.backtest import BacktestRequest
+
+    request = BacktestRequest(
+        symbol="BTC-USDT",
+        start_date=BASE_TIME,
+        end_date=BASE_TIME + timedelta(days=30),
+    )
+    fake_client = _FakeBingXClient()
+
+    reports: list[tuple] = []
+
+    async def on_progress(percent, message):
+        reports.append((percent, message))
+
+    await be.run_backtest(request, client=fake_client, on_progress=on_progress)
+
+    assert reports[0] == (be.HTF_FETCH_PROGRESS_PCT, "Fetching HTF candles...")
+    assert reports[1] == (be.LTF_FETCH_PROGRESS_PCT, "Fetching LTF candles...")
+    assert reports[-1] == (be.DONE_PROGRESS_PCT, "Done")
+    # Percentages must never decrease.
+    assert [p for p, _ in reports] == sorted(p for p, _ in reports)
+
+
+async def test_simulate_reports_monotonically_increasing_progress_during_the_loop() -> None:
+    htf_candles = _uptrend_htf_candles()
+    ltf_candles = _uptrend_ltf_candles()
+
+    async def fetch_1m(start, end) -> list[Candle]:
+        return []
+
+    reports: list[float] = []
+
+    async def on_progress(percent, message):
+        reports.append(percent)
+
+    await be.simulate("BTC-USDT", htf_candles, ltf_candles, 10_000.0, fetch_1m, on_progress)
+
+    assert len(reports) > 0
+    assert reports == sorted(reports)
+    assert all(be.SIMULATION_PROGRESS_START_PCT <= p <= 100 for p in reports)
+
+
+async def test_simulate_without_on_progress_does_not_raise() -> None:
+    htf_candles = _uptrend_htf_candles()
+    ltf_candles = _uptrend_ltf_candles()
+
+    async def fetch_1m(start, end) -> list[Candle]:
+        return []
+
+    result = await be.simulate("BTC-USDT", htf_candles, ltf_candles, 10_000.0, fetch_1m)
+
+    assert result.symbol == "BTC-USDT"

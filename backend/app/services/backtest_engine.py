@@ -69,7 +69,21 @@ RSI_OVERBOUGHT = 70.0
 BOX_PROXIMITY_PCT = 0.005
 TP1_CLOSE_FRACTION = 0.5
 
+HTF_FETCH_PROGRESS_PCT = 0.0
+LTF_FETCH_PROGRESS_PCT = 15.0
+SIMULATION_PROGRESS_START_PCT = 30.0
+SIMULATION_PROGRESS_SPAN_PCT = 70.0
+DONE_PROGRESS_PCT = 100.0
+
 Fetch1mCandles = Callable[[datetime, datetime], Awaitable[list[Candle]]]
+ProgressCallback = Callable[[float, str], Awaitable[None]]
+
+
+async def _report_progress(
+    on_progress: ProgressCallback | None, percent: float, message: str
+) -> None:
+    if on_progress is not None:
+        await on_progress(percent, message)
 
 
 @dataclass
@@ -109,14 +123,19 @@ class _OpenTrade:
 
 
 async def run_backtest(
-    request: BacktestRequest, client: BingXClient | None = None
+    request: BacktestRequest,
+    client: BingXClient | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> BacktestResult:
     client = client or BingXClient()
     htf_start = request.start_date - timedelta(days=HTF_LOOKBACK_BUFFER_DAYS)
 
+    await _report_progress(on_progress, HTF_FETCH_PROGRESS_PCT, "Fetching HTF candles...")
     htf_candles = await client.get_ohlcv(
         request.symbol, Timeframe.HTF_4H, htf_start, request.end_date
     )
+
+    await _report_progress(on_progress, LTF_FETCH_PROGRESS_PCT, "Fetching LTF candles...")
     ltf_candles = await client.get_ohlcv(
         request.symbol, Timeframe.LTF_1H, request.start_date, request.end_date
     )
@@ -125,9 +144,16 @@ async def run_backtest(
         await asyncio.sleep(1.1)  # separate request; stay under the 1 req/s rate limit
         return await client.get_ohlcv(request.symbol, Timeframe.LTF_1M, start, end)
 
-    return await simulate(
-        request.symbol, htf_candles, ltf_candles, request.initial_equity, fetch_1m
+    result = await simulate(
+        request.symbol,
+        htf_candles,
+        ltf_candles,
+        request.initial_equity,
+        fetch_1m,
+        on_progress=on_progress,
     )
+    await _report_progress(on_progress, DONE_PROGRESS_PCT, "Done")
+    return result
 
 
 async def simulate(
@@ -136,6 +162,7 @@ async def simulate(
     ltf_candles: list[Candle],
     initial_equity: float,
     fetch_1m: Fetch1mCandles,
+    on_progress: ProgressCallback | None = None,
 ) -> BacktestResult:
     settings = get_settings()
 
@@ -160,7 +187,18 @@ async def simulate(
     open_trade: _OpenTrade | None = None
     pending_setup: _PendingSetup | None = None
 
+    total_candles = len(ltf_candles)
+    report_every = max(1, total_candles // 100)
+
     for i, candle in enumerate(ltf_candles):
+        if i % report_every == 0 or i == total_candles - 1:
+            percent = SIMULATION_PROGRESS_START_PCT + (i / total_candles) * (
+                SIMULATION_PROGRESS_SPAN_PCT
+            )
+            await _report_progress(
+                on_progress, percent, f"Simulating candle {i + 1}/{total_candles}"
+            )
+
         if open_trade is not None:
             open_trade, closed = _advance_open_trade(open_trade, candle, rsi_values[i])
             if closed is not None:

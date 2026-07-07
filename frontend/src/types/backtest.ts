@@ -61,3 +61,18 @@ export interface BacktestResult {
   positions: Position[];
   summary: BacktestSummary;
 }
+
+export type JobStatus = "pending" | "running" | "completed" | "failed";
+
+export interface BacktestJobCreated {
+  job_id: string;
+}
+
+export interface BacktestJobStatusResponse {
+  job_id: string;
+  status: JobStatus;
+  progress: number;
+  message: string;
+  result: BacktestResult | null;
+  error: string | null;
+}

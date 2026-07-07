@@ -1,9 +1,11 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import axios from "axios";
 import { CandleChart } from "../components/CandleChart";
-import { runBacktest } from "../api/backtest";
+import { createBacktestJob, getBacktestJob } from "../api/backtest";
 import type { BacktestResult } from "../types/backtest";
 import "./BacktestPage.css";
+
+const POLL_INTERVAL_MS = 800;
 
 function formatNumber(value: number, digits = 2): string {
   return value.toLocaleString(undefined, {
@@ -46,11 +48,40 @@ export function BacktestPage() {
   const [startDate, setStartDate] = useState(defaultStart);
   const [endDate, setEndDate] = useState(defaultEnd);
   const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [progressMessage, setProgressMessage] = useState("");
   const [result, setResult] = useState<BacktestResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Guards against a stale poll loop (from a previous run) still updating state
+  // after the user starts a new one.
+  const runIdRef = useRef(0);
+
+  async function pollJob(jobId: string, runId: number) {
+    while (runIdRef.current === runId) {
+      const job = await getBacktestJob(jobId);
+      if (runIdRef.current !== runId) return;
+
+      setProgress(job.progress);
+      setProgressMessage(job.message);
+
+      if (job.status === "completed") {
+        setResult(job.result);
+        setLoading(false);
+        return;
+      }
+      if (job.status === "failed") {
+        setError(job.error ?? "Backtest failed");
+        setLoading(false);
+        return;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+    }
+  }
 
   async function handleRun() {
     setError(null);
+    setResult(null);
 
     if (!symbol.trim() || !startDate || !endDate) {
       setError("Please enter a symbol and both a start and end date.");
@@ -61,18 +92,23 @@ export function BacktestPage() {
       return;
     }
 
+    const runId = ++runIdRef.current;
     setLoading(true);
+    setProgress(0);
+    setProgressMessage("Starting...");
+
     try {
-      const data = await runBacktest({
+      const jobId = await createBacktestJob({
         symbol: symbol.trim(),
         start_date: startDate,
         end_date: endDate,
       });
-      setResult(data);
+      await pollJob(jobId, runId);
     } catch (err) {
-      setError(extractErrorMessage(err));
-    } finally {
-      setLoading(false);
+      if (runIdRef.current === runId) {
+        setError(extractErrorMessage(err));
+        setLoading(false);
+      }
     }
   }
 
@@ -87,6 +123,22 @@ export function BacktestPage() {
           {loading ? "Running..." : "Run Backtest"}
         </button>
       </div>
+      {loading && (
+        <div
+          className="backtest-progress"
+          role="progressbar"
+          aria-valuenow={Math.round(progress)}
+          aria-valuemin={0}
+          aria-valuemax={100}
+        >
+          <div className="backtest-progress-track">
+            <div className="backtest-progress-bar" style={{ width: `${progress}%` }} />
+          </div>
+          <span className="backtest-progress-label">
+            {Math.round(progress)}%{progressMessage ? ` — ${progressMessage}` : ""}
+          </span>
+        </div>
+      )}
       {error && (
         <p className="backtest-error" role="alert">
           {error}

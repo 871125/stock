@@ -83,3 +83,23 @@ class BacktestResult(BaseModel):
     ltf_pivots: list[PivotPoint]
     positions: list[Position]
     summary: BacktestSummary
+
+
+class JobStatus(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class BacktestJobCreated(BaseModel):
+    job_id: str
+
+
+class BacktestJobStatusResponse(BaseModel):
+    job_id: str
+    status: JobStatus
+    progress: float
+    message: str
+    result: BacktestResult | None = None
+    error: str | None = None
