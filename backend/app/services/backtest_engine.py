@@ -3,11 +3,13 @@ entry/SL/TP resolution (spec sections 3-4), and position sizing (spec 5).
 
 Trend-trade entries are further refined with a 1-minute timing layer: once
 the LTF (1h) pivot ("OB") that would normally trigger an immediate entry is
-confirmed, the engine instead waits for price to return to that pivot's
-price (the OB zone) and looks inside that hour's 1-minute candles for a
-reversal-close confirmation before entering. SL/TP are unaffected -- they're
-still derived from the 1h pivot / 4h swing exactly as before; only the entry
-price and timestamp become 1m-precise.
+confirmed, the engine instead tracks the most favorable price reached since
+(the post-pivot extreme) and waits for price to retrace RETRACEMENT_RATIO
+(61.8%, the Fibonacci golden ratio) of the way back toward the pivot -- not
+a full round-trip to the pivot itself -- then looks inside that hour's
+1-minute candles for a reversal-close confirmation before entering. SL/TP
+are unaffected -- they're still derived from the 1h pivot / 4h swing exactly
+as before; only the entry price and timestamp become 1m-precise.
 
 Simplifications (documented, not covered by the spec text):
 - HTF pivots are detected once over the full fetched history and treated as
@@ -68,6 +70,7 @@ RSI_OVERSOLD = 30.0
 RSI_OVERBOUGHT = 70.0
 BOX_PROXIMITY_PCT = 0.005
 TP1_CLOSE_FRACTION = 0.5
+RETRACEMENT_RATIO = 0.618  # Fibonacci golden ratio; fraction of the post-pivot move retraced
 
 HTF_FETCH_PROGRESS_PCT = 0.0
 LTF_FETCH_PROGRESS_PCT = 15.0
@@ -97,12 +100,15 @@ class _TrendWindow:
 @dataclass
 class _PendingSetup:
     """An LTF pivot ("OB") confirmed in the trend direction, awaiting a 1m
-    reversal-close entry once price returns to the pivot's price."""
+    reversal-close entry once price retraces RETRACEMENT_RATIO of the way back
+    from the post-pivot extreme toward the pivot price, rather than requiring
+    a full round-trip back to the pivot itself."""
 
     side: PositionSide
     pivot_price: float
     tp_price: float
     stop_loss: float
+    extreme_price: float  # most favorable price (high/low) seen since the pivot confirmed
 
 
 @dataclass
@@ -222,14 +228,20 @@ async def simulate(
                 for pivot in confirmed_at.get(i, []):
                     if pivot.type == PivotType.SWING_LOW:
                         pending_setup = _build_pending_setup(
-                            PositionSide.LONG, pivot.price, window.recent_sh_price
+                            PositionSide.LONG,
+                            pivot.price,
+                            window.recent_sh_price,
+                            extreme_price=candle.high,
                         )
                         break
             elif window.trend == TrendState.DOWNTREND:
                 for pivot in confirmed_at.get(i, []):
                     if pivot.type == PivotType.SWING_HIGH:
                         pending_setup = _build_pending_setup(
-                            PositionSide.SHORT, pivot.price, window.recent_sl_price
+                            PositionSide.SHORT,
+                            pivot.price,
+                            window.recent_sl_price,
+                            extreme_price=candle.low,
                         )
                         break
             elif i > 0:
@@ -238,6 +250,7 @@ async def simulate(
                 )
 
         if pending_setup is not None:
+            _update_pending_setup_extreme(pending_setup, candle)
             opened = await _try_fill_pending_setup(
                 pending_setup, candle, fetch_1m, equity, settings
             )
@@ -316,13 +329,32 @@ def _setup_matches_trend(setup: _PendingSetup, trend: TrendState) -> bool:
     return trend == TrendState.DOWNTREND
 
 
-def _build_pending_setup(side: PositionSide, pivot_price: float, tp_price: float) -> _PendingSetup:
+def _build_pending_setup(
+    side: PositionSide,
+    pivot_price: float,
+    tp_price: float,
+    extreme_price: float | None = None,
+) -> _PendingSetup:
     return _PendingSetup(
         side=side,
         pivot_price=pivot_price,
         tp_price=tp_price,
         stop_loss=_trend_stop_loss(side, pivot_price),
+        extreme_price=extreme_price if extreme_price is not None else pivot_price,
     )
+
+
+def _update_pending_setup_extreme(setup: _PendingSetup, candle: Candle) -> None:
+    if setup.side == PositionSide.LONG:
+        setup.extreme_price = max(setup.extreme_price, candle.high)
+    else:
+        setup.extreme_price = min(setup.extreme_price, candle.low)
+
+
+def _retracement_zone_price(setup: _PendingSetup) -> float:
+    """Midpoint between the pivot and the most favorable price reached since --
+    i.e. the price level RETRACEMENT_RATIO of the way back toward the pivot."""
+    return setup.pivot_price + RETRACEMENT_RATIO * (setup.extreme_price - setup.pivot_price)
 
 
 def _pending_setup_invalidated(setup: _PendingSetup, candle: Candle) -> bool:
@@ -338,16 +370,15 @@ async def _try_fill_pending_setup(
     equity: float,
     settings: Settings,
 ) -> _OpenTrade | None:
+    zone_price = _retracement_zone_price(setup)
     touched_zone = (
-        candle.low <= setup.pivot_price
-        if setup.side == PositionSide.LONG
-        else candle.high >= setup.pivot_price
+        candle.low <= zone_price if setup.side == PositionSide.LONG else candle.high >= zone_price
     )
     if not touched_zone:
         return None
 
     one_minute_candles = await fetch_1m(candle.timestamp, candle.timestamp + timedelta(hours=1))
-    entry = _find_1m_reversal_entry(setup.side, setup.pivot_price, one_minute_candles)
+    entry = _find_1m_reversal_entry(setup.side, zone_price, one_minute_candles)
     if entry is None:
         return None
 

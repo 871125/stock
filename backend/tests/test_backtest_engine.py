@@ -134,6 +134,81 @@ def test_build_pending_setup_computes_stop_loss() -> None:
     assert short_setup.stop_loss == pytest.approx(100 * (1 + be.SL_BUFFER_PCT))
 
 
+def test_build_pending_setup_defaults_extreme_price_to_pivot() -> None:
+    setup = be._build_pending_setup(PositionSide.LONG, 100, 120)
+    assert setup.extreme_price == 100
+
+
+def test_retracement_zone_price_uses_golden_ratio() -> None:
+    long_setup = be._build_pending_setup(PositionSide.LONG, 100, 200, extreme_price=110)
+    assert be._retracement_zone_price(long_setup) == pytest.approx(
+        100 + be.RETRACEMENT_RATIO * 10
+    )
+
+    short_setup = be._build_pending_setup(PositionSide.SHORT, 100, 50, extreme_price=90)
+    assert be._retracement_zone_price(short_setup) == pytest.approx(
+        100 - be.RETRACEMENT_RATIO * 10
+    )
+
+
+def test_update_pending_setup_extreme_tracks_most_favorable_price_only() -> None:
+    long_setup = be._build_pending_setup(PositionSide.LONG, 100, 200, extreme_price=105)
+    be._update_pending_setup_extreme(long_setup, make_candle(1, 106, 108, 104, 107))
+    assert long_setup.extreme_price == 108  # new high extends it
+
+    be._update_pending_setup_extreme(long_setup, make_candle(2, 107, 107.5, 103, 104))
+    assert long_setup.extreme_price == 108  # a pullback bar doesn't shrink it
+
+    short_setup = be._build_pending_setup(PositionSide.SHORT, 100, 50, extreme_price=95)
+    be._update_pending_setup_extreme(short_setup, make_candle(1, 94, 96, 92, 93))
+    assert short_setup.extreme_price == 92  # new low extends it further down
+
+
+async def test_try_fill_pending_setup_enters_on_golden_ratio_retracement() -> None:
+    # pivot=100, extreme reached=110 -> 61.8% retracement zone = 106.18. Price only pulls back
+    # to 104 (nowhere near the original pivot at 100) and the entry should still fill there.
+    setup = be._build_pending_setup(
+        PositionSide.LONG, pivot_price=100, tp_price=200, extreme_price=110
+    )
+    candle = make_candle(1, 108, 109, 104, 106)
+
+    reversal_time = candle.timestamp + timedelta(minutes=1)
+    one_minute_candles = [
+        Candle(
+            timestamp=reversal_time, open=104.2, high=105.5, low=104.0, close=105.2, volume=1
+        ),
+    ]
+
+    async def fetch_1m(start, end) -> list[Candle]:
+        return one_minute_candles
+
+    opened = await be._try_fill_pending_setup(setup, candle, fetch_1m, 10_000, SETTINGS)
+
+    assert opened is not None
+    assert opened.entry_price == 105.2
+    assert opened.entry_time == reversal_time
+
+
+async def test_try_fill_pending_setup_does_not_touch_zone_before_golden_ratio_retracement() -> None:
+    # pivot=100, extreme=120 -> 61.8% retracement zone = 112.36. Price only pulls back to
+    # 113 -- short of the zone.
+    setup = be._build_pending_setup(
+        PositionSide.LONG, pivot_price=100, tp_price=200, extreme_price=120
+    )
+    candle = make_candle(1, 115, 116, 113, 114)
+
+    calls: list[tuple] = []
+
+    async def fetch_1m(start, end) -> list[Candle]:
+        calls.append((start, end))
+        return []
+
+    opened = await be._try_fill_pending_setup(setup, candle, fetch_1m, 10_000, SETTINGS)
+
+    assert opened is None
+    assert calls == []
+
+
 def test_pending_setup_invalidated_on_body_close_past_stop_loss() -> None:
     long_setup = be._build_pending_setup(PositionSide.LONG, 100, 120)
 
@@ -487,18 +562,20 @@ def _uptrend_htf_candles() -> list[Candle]:
 
 def _uptrend_ltf_candles() -> list[Candle]:
     # Starts after the HTF uptrend is confirmed (hour 76). Forms one LTF swing low ("OB")
-    # at hour 79 (confirmed at hour 81 with LTF_PIVOT_LOOKBACK=2). Price then pulls back to
-    # retouch that OB zone (103) at hour 83 -- that's where the 1m reversal-close entry
-    # fires (see the fetch_1m stub in the test) -- before rallying to the HTF take-profit
-    # target (134) by hour 86.
+    # at hour 79 (confirmed at hour 81 with LTF_PIVOT_LOOKBACK=2). The post-pivot extreme
+    # climbs to 112 (hour 82's high), so the 61.8% (golden ratio) retracement zone sits at
+    # 103 + 0.618*(112-103) = 108.562 -- hour 82's low (108) already reaches it, which is
+    # where the 1m reversal-close entry fires (see the fetch_1m stub in the test), well
+    # before price would have fully round-tripped back to the pivot itself (103, touched at
+    # hour 83). Price then rallies to the HTF take-profit target (134) by hour 86.
     rows = [
         (77, 109, 111, 109, 110),
         (78, 106, 108, 106, 107),
         (79, 103, 105, 103, 104),  # swing low candidate, low=103
         (80, 105, 107, 105, 106),
-        (81, 108, 110, 108, 109.5),  # confirmation bar; zone not touched yet (low=108)
-        (82, 109, 112, 108, 111),  # still no touch
-        (83, 110, 111, 103, 110.5),  # low=103 retouches the OB zone -> 1m fetch triggers
+        (81, 108, 110, 108, 109.5),  # confirmation bar; extreme=110, zone=107.326, not touched
+        (82, 109, 112, 108, 111),  # extreme updates to 112, zone=108.562 -> touched (low=108)
+        (83, 110, 111, 103, 110.5),
         (84, 112, 120, 111, 119),
         (85, 120, 128, 119, 127),
         (86, 128, 136, 127, 134),  # high >= 134 -> take profit
@@ -521,26 +598,26 @@ async def test_simulate_full_uptrend_long_trade_hits_take_profit() -> None:
     ltf_candles = _uptrend_ltf_candles()
     initial_equity = 10_000.0
 
-    zone_touch_candle = ltf_candles[6]  # hour 83, the OB retouch
-    assert zone_touch_candle.timestamp == BASE_TIME + timedelta(hours=83)
+    zone_touch_candle = ltf_candles[5]  # hour 82, where the 61.8% zone (108.562) is reached
+    assert zone_touch_candle.timestamp == BASE_TIME + timedelta(hours=82)
     reversal_time = zone_touch_candle.timestamp + timedelta(minutes=1)
     one_minute_candles = [
         # First minute: touches the zone but closes bearish -> not yet a reversal.
         Candle(
             timestamp=zone_touch_candle.timestamp,
-            open=103.5,
-            high=103.6,
-            low=102.8,
-            close=103.0,
+            open=109.0,
+            high=109.2,
+            low=108.3,
+            close=108.7,
             volume=1.0,
         ),
         # Second minute: touches the zone and closes bullish -> reversal entry.
         Candle(
             timestamp=reversal_time,
-            open=103.0,
-            high=103.9,
-            low=102.9,
-            close=103.8,
+            open=108.7,
+            high=109.5,
+            low=108.4,
+            close=109.3,
             volume=1.0,
         ),
     ]
@@ -553,7 +630,7 @@ async def test_simulate_full_uptrend_long_trade_hits_take_profit() -> None:
 
     result = await be.simulate("BTC-USDT", htf_candles, ltf_candles, initial_equity, fetch_1m)
 
-    # fetch_1m is only called once: when the OB zone is actually retouched (hour 83).
+    # fetch_1m is only called once: when the 61.8% retracement zone is first reached (hour 82).
     assert fetch_calls == [
         (zone_touch_candle.timestamp, zone_touch_candle.timestamp + timedelta(hours=1))
     ]
@@ -570,7 +647,7 @@ async def test_simulate_full_uptrend_long_trade_hits_take_profit() -> None:
     assert len(result.positions) == 1
     position = result.positions[0]
 
-    entry_price = 103.8
+    entry_price = 109.3
     stop_loss = 103 * (1 - be.SL_BUFFER_PCT)
     take_profit = 134  # most recent confirmed HTF swing high
     sizing = calculate_position_size(
