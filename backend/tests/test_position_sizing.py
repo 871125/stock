@@ -1,6 +1,6 @@
 import pytest
 
-from app.services.position_sizing import calculate_position_size
+from app.services.position_sizing import calculate_position_size, derive_liquidation_buffer_pct
 
 DEFAULT_KWARGS = dict(
     risk_per_trade_pct=0.01,
@@ -85,3 +85,20 @@ def test_raises_on_invalid_inputs(overrides: dict) -> None:
 
     with pytest.raises(ValueError):
         calculate_position_size(**kwargs)
+
+
+def test_derive_liquidation_buffer_pct_matches_spec_default_at_10x() -> None:
+    # Spec 5.3: 10x leverage -> ~10% liquidation move, 9% buffer used in practice.
+    assert derive_liquidation_buffer_pct(10) == pytest.approx(0.09)
+
+
+def test_derive_liquidation_buffer_pct_scales_with_leverage() -> None:
+    assert derive_liquidation_buffer_pct(20) == pytest.approx(0.045)
+    assert derive_liquidation_buffer_pct(5) == pytest.approx(0.18)
+
+
+def test_derive_liquidation_buffer_pct_rejects_non_positive_leverage() -> None:
+    with pytest.raises(ValueError):
+        derive_liquidation_buffer_pct(0)
+    with pytest.raises(ValueError):
+        derive_liquidation_buffer_pct(-10)

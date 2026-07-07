@@ -17,7 +17,8 @@ class Settings(BaseSettings):
 
     risk_per_trade_pct: float = 0.01
     leverage: int = 10
-    liquidation_buffer_pct: float = 0.09
+    # Liquidation buffer is derived from leverage (see
+    # position_sizing.derive_liquidation_buffer_pct), not set independently.
 
 
 @lru_cache

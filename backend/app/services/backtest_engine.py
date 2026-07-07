@@ -57,7 +57,7 @@ from app.services.bingx_client import BingXClient
 from app.services.indicators import rsi
 from app.services.market_structure import classify_trend
 from app.services.pivot import detect_pivots
-from app.services.position_sizing import calculate_position_size
+from app.services.position_sizing import calculate_position_size, derive_liquidation_buffer_pct
 
 HTF_PIVOT_LOOKBACK = 2
 LTF_PIVOT_LOOKBACK = 2
@@ -402,7 +402,7 @@ def _try_open_trend_trade(
         stop_loss_price=stop_loss,
         risk_per_trade_pct=settings.risk_per_trade_pct,
         leverage=settings.leverage,
-        liquidation_buffer_pct=settings.liquidation_buffer_pct,
+        liquidation_buffer_pct=derive_liquidation_buffer_pct(settings.leverage),
     )
     if sizing.is_liquidation_risk:
         return None
@@ -489,7 +489,7 @@ def _try_open_box_trade(
         stop_loss_price=stop_loss,
         risk_per_trade_pct=settings.risk_per_trade_pct,
         leverage=settings.leverage,
-        liquidation_buffer_pct=settings.liquidation_buffer_pct,
+        liquidation_buffer_pct=derive_liquidation_buffer_pct(settings.leverage),
     )
     if sizing.is_liquidation_risk:
         return None

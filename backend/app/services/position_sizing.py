@@ -10,9 +10,23 @@ If sl_distance_pct exceeds liquidation_buffer_pct at the configured leverage,
 the trade must be skipped or leverage reduced (spec 5.3). This function only
 flags that risk via `is_liquidation_risk`; the skip/reduce-leverage decision
 is the caller's (backtest_engine / bot).
+
+`liquidation_buffer_pct` should be derived from leverage (see
+`derive_liquidation_buffer_pct`), not set independently -- otherwise raising
+leverage no longer tightens the liquidation check the way spec 5.3 intends.
 """
 
 from dataclasses import dataclass
+
+LIQUIDATION_SAFETY_FACTOR = 0.9
+
+
+def derive_liquidation_buffer_pct(leverage: int) -> float:
+    """Approximate liquidation move at this leverage is 1/leverage; leave a
+    safety margin below it (spec 5.3's 9% at 10x is exactly 0.9 * 1/10)."""
+    if leverage <= 0:
+        raise ValueError("leverage must be > 0")
+    return (1 / leverage) * LIQUIDATION_SAFETY_FACTOR
 
 
 @dataclass

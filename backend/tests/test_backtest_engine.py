@@ -5,10 +5,10 @@ import pytest
 from app.core.config import Settings
 from app.schemas.backtest import Candle, PivotPoint, PivotType, PositionSide, TrendState
 from app.services import backtest_engine as be
-from app.services.position_sizing import calculate_position_size
+from app.services.position_sizing import calculate_position_size, derive_liquidation_buffer_pct
 
 BASE_TIME = datetime(2024, 1, 1, tzinfo=UTC)
-SETTINGS = Settings(risk_per_trade_pct=0.01, leverage=10, liquidation_buffer_pct=0.09)
+SETTINGS = Settings(risk_per_trade_pct=0.01, leverage=10)
 
 
 def make_candle(
@@ -80,7 +80,7 @@ def test_open_long_trend_trade_succeeds() -> None:
     )
     assert trade is not None
     assert trade.side == PositionSide.LONG
-    assert trade.stop_loss == pytest.approx(95 * 0.999)
+    assert trade.stop_loss == pytest.approx(95 * (1 - be.SL_BUFFER_PCT))
     assert trade.take_profit == 120
     assert trade.quantity > 0
 
@@ -128,10 +128,10 @@ def test_setup_matches_trend() -> None:
 
 def test_build_pending_setup_computes_stop_loss() -> None:
     long_setup = be._build_pending_setup(PositionSide.LONG, 100, 120)
-    assert long_setup.stop_loss == pytest.approx(100 * 0.999)
+    assert long_setup.stop_loss == pytest.approx(100 * (1 - be.SL_BUFFER_PCT))
 
     short_setup = be._build_pending_setup(PositionSide.SHORT, 100, 80)
-    assert short_setup.stop_loss == pytest.approx(100 * 1.001)
+    assert short_setup.stop_loss == pytest.approx(100 * (1 + be.SL_BUFFER_PCT))
 
 
 def test_pending_setup_invalidated_on_body_close_past_stop_loss() -> None:
@@ -208,7 +208,7 @@ async def test_try_fill_pending_setup_enters_on_1m_reversal() -> None:
     assert opened is not None
     assert opened.entry_price == 100.7
     assert opened.entry_time == reversal_time
-    assert opened.stop_loss == pytest.approx(100 * 0.999)
+    assert opened.stop_loss == pytest.approx(100 * (1 - be.SL_BUFFER_PCT))
     assert opened.take_profit == 120
 
 
@@ -571,7 +571,7 @@ async def test_simulate_full_uptrend_long_trade_hits_take_profit() -> None:
     position = result.positions[0]
 
     entry_price = 103.8
-    stop_loss = 103 * 0.999
+    stop_loss = 103 * (1 - be.SL_BUFFER_PCT)
     take_profit = 134  # most recent confirmed HTF swing high
     sizing = calculate_position_size(
         equity=initial_equity,
@@ -579,7 +579,7 @@ async def test_simulate_full_uptrend_long_trade_hits_take_profit() -> None:
         stop_loss_price=stop_loss,
         risk_per_trade_pct=SETTINGS.risk_per_trade_pct,
         leverage=SETTINGS.leverage,
-        liquidation_buffer_pct=SETTINGS.liquidation_buffer_pct,
+        liquidation_buffer_pct=derive_liquidation_buffer_pct(SETTINGS.leverage),
     )
     expected_pnl = (take_profit - entry_price) * sizing.quantity
 
