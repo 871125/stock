@@ -15,6 +15,13 @@ the HTF swing is frequently too far away to realistically reach, so pinning
 TP to a fixed multiple of risk raises the odds of actually hitting it. SL is
 unaffected -- still derived from the 1h pivot exactly as before.
 
+TREND_TP_HYBRID_MODE (default off, experimental) closes TP1_CLOSE_FRACTION of
+the position at the forced RR target (as above) and lets the rest ride to the
+opposite HTF swing that was active when the pending setup formed -- the TP
+the engine used before RR forcing was introduced. SL moves to breakeven once
+TP1 fills. A setup is skipped if the HTF swing doesn't sit beyond the RR
+target in the trade direction (no room for a runner leg).
+
 Simplifications (documented, not covered by the spec text):
 - HTF pivots are detected once over the full fetched history and treated as
   "known" starting `HTF_PIVOT_LOOKBACK` candles after they occur (same for
@@ -76,6 +83,7 @@ BOX_PROXIMITY_PCT = 0.005
 TP1_CLOSE_FRACTION = 0.5
 RETRACEMENT_RATIO = 0.5  # fraction of the post-pivot move retraced before entry is armed
 TREND_TP_RISK_REWARD_RATIO = 2.0  # trend-trade TP = entry +/- this multiple of the SL distance
+TREND_TP_HYBRID_MODE = False  # experimental: partial TP1 at forced RR, runner to opposite HTF swing
 
 HTF_FETCH_PROGRESS_PCT = 0.0
 LTF_FETCH_PROGRESS_PCT = 15.0
@@ -113,6 +121,7 @@ class _PendingSetup:
     pivot_price: float
     stop_loss: float
     extreme_price: float  # most favorable price (high/low) seen since the pivot confirmed
+    tp2_price: float | None = None  # opposite HTF swing at setup time; only used in hybrid mode
 
 
 @dataclass
@@ -232,14 +241,20 @@ async def simulate(
                 for pivot in confirmed_at.get(i, []):
                     if pivot.type == PivotType.SWING_LOW:
                         pending_setup = _build_pending_setup(
-                            PositionSide.LONG, pivot.price, extreme_price=candle.high
+                            PositionSide.LONG,
+                            pivot.price,
+                            extreme_price=candle.high,
+                            tp2_price=window.recent_sh_price,
                         )
                         break
             elif window.trend == TrendState.DOWNTREND:
                 for pivot in confirmed_at.get(i, []):
                     if pivot.type == PivotType.SWING_HIGH:
                         pending_setup = _build_pending_setup(
-                            PositionSide.SHORT, pivot.price, extreme_price=candle.low
+                            PositionSide.SHORT,
+                            pivot.price,
+                            extreme_price=candle.low,
+                            tp2_price=window.recent_sl_price,
                         )
                         break
             elif i > 0:
@@ -331,12 +346,14 @@ def _build_pending_setup(
     side: PositionSide,
     pivot_price: float,
     extreme_price: float | None = None,
+    tp2_price: float | None = None,
 ) -> _PendingSetup:
     return _PendingSetup(
         side=side,
         pivot_price=pivot_price,
         stop_loss=_trend_stop_loss(side, pivot_price),
         extreme_price=extreme_price if extreme_price is not None else pivot_price,
+        tp2_price=tp2_price,
     )
 
 
@@ -386,12 +403,24 @@ async def _try_fill_pending_setup(
         return None
 
     entry_price, entry_time = entry
-    tp_price = _forced_take_profit(setup.side, entry_price, setup.stop_loss)
+    tp1_price = _forced_take_profit(setup.side, entry_price, setup.stop_loss)
+    if TREND_TP_HYBRID_MODE:
+        assert setup.tp2_price is not None
+        return _try_open_hybrid_trend_trade(
+            side=setup.side,
+            entry_price=entry_price,
+            pivot_price=setup.pivot_price,
+            tp1_price=tp1_price,
+            tp2_price=setup.tp2_price,
+            entry_time=entry_time,
+            equity=equity,
+            settings=settings,
+        )
     return _try_open_trend_trade(
         side=setup.side,
         entry_price=entry_price,
         pivot_price=setup.pivot_price,
-        tp_price=tp_price,
+        tp_price=tp1_price,
         entry_time=entry_time,
         equity=equity,
         settings=settings,
@@ -451,6 +480,51 @@ def _try_open_trend_trade(
         is_box_trade=False,
         stop_loss=stop_loss,
         take_profit=tp_price,
+    )
+
+
+def _try_open_hybrid_trend_trade(
+    side: PositionSide,
+    entry_price: float,
+    pivot_price: float,
+    tp1_price: float,
+    tp2_price: float,
+    entry_time: datetime,
+    equity: float,
+    settings: Settings,
+) -> _OpenTrade | None:
+    """Like _try_open_trend_trade, but TP1_CLOSE_FRACTION exits at the forced RR
+    target (tp1_price) and the remainder rides to the opposite HTF swing
+    (tp2_price). Rejected if tp2 doesn't sit beyond tp1 -- no room for a runner."""
+    stop_loss = _trend_stop_loss(side, pivot_price)
+    if side == PositionSide.LONG:
+        if not (stop_loss < entry_price < tp1_price < tp2_price):
+            return None
+    else:
+        if not (tp2_price < tp1_price < entry_price < stop_loss):
+            return None
+
+    sizing = calculate_position_size(
+        equity=equity,
+        entry_price=entry_price,
+        stop_loss_price=stop_loss,
+        risk_per_trade_pct=settings.risk_per_trade_pct,
+        leverage=settings.leverage,
+        liquidation_buffer_pct=derive_liquidation_buffer_pct(settings.leverage),
+    )
+    if sizing.is_liquidation_risk:
+        return None
+
+    return _OpenTrade(
+        sequence_no=0,
+        side=side,
+        entry_price=entry_price,
+        entry_time=entry_time,
+        quantity=sizing.quantity,
+        is_box_trade=False,
+        stop_loss=stop_loss,
+        take_profit_1=tp1_price,
+        take_profit_2=tp2_price,
     )
 
 
@@ -547,6 +621,8 @@ def _advance_open_trade(
 ) -> tuple[_OpenTrade | None, Position | None]:
     if trade.is_box_trade:
         return _advance_box_trade(trade, candle, rsi_value)
+    if trade.take_profit_1 is not None:
+        return _advance_hybrid_trend_trade(trade, candle)
     return _advance_trend_trade(trade, candle)
 
 
@@ -609,6 +685,43 @@ def _advance_box_trade(
         trade.remaining_fraction -= TP1_CLOSE_FRACTION
         trade.tp1_hit = True
         trade.stop_loss = trade.entry_price  # move to breakeven
+
+    return trade, None
+
+
+def _advance_hybrid_trend_trade(
+    trade: _OpenTrade, candle: Candle
+) -> tuple[_OpenTrade | None, Position | None]:
+    assert trade.take_profit_1 is not None
+    assert trade.take_profit_2 is not None
+
+    if trade.side == PositionSide.LONG:
+        sl_hit = candle.low <= trade.stop_loss
+        tp2_hit = candle.high >= trade.take_profit_2
+        tp1_hit_now = candle.high >= trade.take_profit_1
+    else:
+        sl_hit = candle.high >= trade.stop_loss
+        tp2_hit = candle.low <= trade.take_profit_2
+        tp1_hit_now = candle.low <= trade.take_profit_1
+
+    remaining_qty = trade.quantity * trade.remaining_fraction
+
+    if sl_hit:
+        pnl = _signed_pnl(trade.side, trade.entry_price, trade.stop_loss, remaining_qty)
+        return None, _close_position(trade, trade.stop_loss, candle.timestamp, pnl)
+
+    if tp2_hit:
+        pnl = _signed_pnl(trade.side, trade.entry_price, trade.take_profit_2, remaining_qty)
+        return None, _close_position(trade, trade.take_profit_2, candle.timestamp, pnl)
+
+    if not trade.tp1_hit and tp1_hit_now:
+        partial_qty = trade.quantity * TP1_CLOSE_FRACTION
+        trade.realized_pnl += _signed_pnl(
+            trade.side, trade.entry_price, trade.take_profit_1, partial_qty
+        )
+        trade.remaining_fraction -= TP1_CLOSE_FRACTION
+        trade.tp1_hit = True
+        trade.stop_loss = trade.entry_price  # move to breakeven after securing partial profit
 
     return trade, None
 

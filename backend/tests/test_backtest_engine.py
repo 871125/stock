@@ -112,6 +112,123 @@ def test_open_trend_trade_skipped_on_liquidation_risk() -> None:
     assert trade is None
 
 
+# ---- _try_open_hybrid_trend_trade / _advance_hybrid_trend_trade -----------------------------
+
+
+def test_open_hybrid_trend_trade_succeeds_when_tp2_beyond_tp1() -> None:
+    trade = be._try_open_hybrid_trend_trade(
+        side=PositionSide.LONG,
+        entry_price=100,
+        pivot_price=95,
+        tp1_price=110,
+        tp2_price=130,
+        entry_time=BASE_TIME,
+        equity=10_000,
+        settings=SETTINGS,
+    )
+    assert trade is not None
+    assert trade.take_profit_1 == 110
+    assert trade.take_profit_2 == 130
+    assert trade.take_profit is None
+    assert trade.remaining_fraction == 1.0
+    assert trade.tp1_hit is False
+
+
+def test_open_hybrid_trend_trade_rejects_tp2_not_beyond_tp1() -> None:
+    # Opposite HTF swing (108) sits closer than the forced RR target (110) -- no room to run.
+    trade = be._try_open_hybrid_trend_trade(
+        side=PositionSide.LONG,
+        entry_price=100,
+        pivot_price=95,
+        tp1_price=110,
+        tp2_price=108,
+        entry_time=BASE_TIME,
+        equity=10_000,
+        settings=SETTINGS,
+    )
+    assert trade is None
+
+
+def test_advance_hybrid_trend_trade_partial_tp1_then_runs_to_tp2() -> None:
+    trade = be._try_open_hybrid_trend_trade(
+        side=PositionSide.LONG,
+        entry_price=100,
+        pivot_price=95,
+        tp1_price=110,
+        tp2_price=130,
+        entry_time=BASE_TIME,
+        equity=10_000,
+        settings=SETTINGS,
+    )
+    assert trade is not None
+    full_qty = trade.quantity
+
+    # Candle touches TP1 but not TP2 -> half closes, SL moves to breakeven, trade stays open.
+    trade, closed = be._advance_hybrid_trend_trade(trade, make_candle(1, 108, 112, 107, 111))
+    assert closed is None
+    assert trade is not None
+    assert trade.tp1_hit is True
+    assert trade.remaining_fraction == pytest.approx(0.5)
+    assert trade.stop_loss == 100  # breakeven == entry price
+    expected_tp1_pnl = (110 - 100) * (full_qty * 0.5)
+    assert trade.realized_pnl == pytest.approx(expected_tp1_pnl)
+
+    # Candle reaches TP2 -> remaining half closes at tp2.
+    trade, closed = be._advance_hybrid_trend_trade(trade, make_candle(2, 125, 132, 124, 131))
+    assert trade is None
+    assert closed is not None
+    assert closed.take_profit == 130
+    expected_tp2_pnl = (130 - 100) * (full_qty * 0.5)
+    assert closed.pnl == pytest.approx(expected_tp1_pnl + expected_tp2_pnl)
+    assert closed.is_win is True
+
+
+def test_advance_hybrid_trend_trade_sl_after_tp1_exits_at_breakeven() -> None:
+    trade = be._try_open_hybrid_trend_trade(
+        side=PositionSide.LONG,
+        entry_price=100,
+        pivot_price=95,
+        tp1_price=110,
+        tp2_price=130,
+        entry_time=BASE_TIME,
+        equity=10_000,
+        settings=SETTINGS,
+    )
+    assert trade is not None
+    full_qty = trade.quantity
+
+    trade, _ = be._advance_hybrid_trend_trade(trade, make_candle(1, 108, 112, 107, 111))
+    assert trade is not None
+
+    # Price falls back to the (now breakeven) stop -- remaining half exits flat.
+    trade, closed = be._advance_hybrid_trend_trade(trade, make_candle(2, 105, 106, 99, 100))
+    assert trade is None
+    assert closed is not None
+    expected_tp1_pnl = (110 - 100) * (full_qty * 0.5)
+    assert closed.pnl == pytest.approx(expected_tp1_pnl + 0.0)
+    assert closed.is_win is True  # net still positive thanks to the secured TP1 leg
+
+
+def test_advance_hybrid_trend_trade_sl_before_tp1_closes_full_at_loss() -> None:
+    trade = be._try_open_hybrid_trend_trade(
+        side=PositionSide.LONG,
+        entry_price=100,
+        pivot_price=95,
+        tp1_price=110,
+        tp2_price=130,
+        entry_time=BASE_TIME,
+        equity=10_000,
+        settings=SETTINGS,
+    )
+    assert trade is not None
+
+    trade, closed = be._advance_hybrid_trend_trade(trade, make_candle(1, 99, 100, 94.9, 95))
+    assert trade is None
+    assert closed is not None
+    assert closed.is_win is False
+    assert closed.exit_time == BASE_TIME + timedelta(hours=1)
+
+
 # ---- pending 1m-entry setup ---------------------------------------------------------------
 
 
@@ -683,6 +800,67 @@ async def test_simulate_full_uptrend_long_trade_hits_take_profit() -> None:
     assert result.summary.total_trades == 1
     assert result.summary.win_count == 1
     assert result.summary.final_equity == pytest.approx(initial_equity + expected_pnl)
+
+
+async def test_simulate_hybrid_mode_partial_tp_then_runs_to_htf_swing(monkeypatch) -> None:
+    monkeypatch.setattr(be, "TREND_TP_HYBRID_MODE", True)
+
+    htf_candles = _uptrend_htf_candles()
+    ltf_candles = _uptrend_ltf_candles()
+    initial_equity = 10_000.0
+
+    zone_touch_candle = ltf_candles[5]  # hour 82
+    reversal_time = zone_touch_candle.timestamp + timedelta(minutes=1)
+    one_minute_candles = [
+        Candle(
+            timestamp=zone_touch_candle.timestamp,
+            open=108.0,
+            high=108.2,
+            low=107.3,
+            close=107.7,
+            volume=1.0,
+        ),
+        Candle(
+            timestamp=reversal_time,
+            open=107.7,
+            high=108.5,
+            low=107.4,
+            close=108.1,
+            volume=1.0,
+        ),
+    ]
+
+    async def fetch_1m(start, end) -> list[Candle]:
+        return one_minute_candles
+
+    result = await be.simulate("BTC-USDT", htf_candles, ltf_candles, initial_equity, fetch_1m)
+
+    assert len(result.positions) == 1
+    position = result.positions[0]
+
+    entry_price = 108.1
+    stop_loss = 103 * (1 - be.SL_BUFFER_PCT)
+    take_profit_1 = entry_price + be.TREND_TP_RISK_REWARD_RATIO * (entry_price - stop_loss)
+    take_profit_2 = 134.0  # the HTF window's recent_sh_price -- the pre-RR-forcing TP target
+
+    sizing = calculate_position_size(
+        equity=initial_equity,
+        entry_price=entry_price,
+        stop_loss_price=stop_loss,
+        risk_per_trade_pct=SETTINGS.risk_per_trade_pct,
+        leverage=SETTINGS.leverage,
+        liquidation_buffer_pct=derive_liquidation_buffer_pct(SETTINGS.leverage),
+    )
+    leg1_pnl = (take_profit_1 - entry_price) * (sizing.quantity * be.TP1_CLOSE_FRACTION)
+    leg2_pnl = (take_profit_2 - entry_price) * (sizing.quantity * (1 - be.TP1_CLOSE_FRACTION))
+
+    assert position.entry_price == entry_price
+    assert position.take_profit_1 == pytest.approx(take_profit_1)
+    assert position.take_profit == pytest.approx(take_profit_2)
+    assert position.pnl == pytest.approx(leg1_pnl + leg2_pnl)
+    assert position.is_win is True
+    # TP1 fires at hour 84 (same as the RR=2-only test); TP2 (134) isn't reached until hour 86.
+    assert position.exit_time == BASE_TIME + timedelta(hours=86)
 
 
 # ---- run_backtest wiring -------------------------------------------------------------------
