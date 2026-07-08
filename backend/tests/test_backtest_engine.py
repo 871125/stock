@@ -116,8 +116,8 @@ def test_open_trend_trade_skipped_on_liquidation_risk() -> None:
 
 
 def test_setup_matches_trend() -> None:
-    long_setup = be._build_pending_setup(PositionSide.LONG, 100, 120)
-    short_setup = be._build_pending_setup(PositionSide.SHORT, 120, 100)
+    long_setup = be._build_pending_setup(PositionSide.LONG, 100)
+    short_setup = be._build_pending_setup(PositionSide.SHORT, 120)
 
     assert be._setup_matches_trend(long_setup, TrendState.UPTREND) is True
     assert be._setup_matches_trend(long_setup, TrendState.DOWNTREND) is False
@@ -127,39 +127,47 @@ def test_setup_matches_trend() -> None:
 
 
 def test_build_pending_setup_computes_stop_loss() -> None:
-    long_setup = be._build_pending_setup(PositionSide.LONG, 100, 120)
+    long_setup = be._build_pending_setup(PositionSide.LONG, 100)
     assert long_setup.stop_loss == pytest.approx(100 * (1 - be.SL_BUFFER_PCT))
 
-    short_setup = be._build_pending_setup(PositionSide.SHORT, 100, 80)
+    short_setup = be._build_pending_setup(PositionSide.SHORT, 100)
     assert short_setup.stop_loss == pytest.approx(100 * (1 + be.SL_BUFFER_PCT))
 
 
 def test_build_pending_setup_defaults_extreme_price_to_pivot() -> None:
-    setup = be._build_pending_setup(PositionSide.LONG, 100, 120)
+    setup = be._build_pending_setup(PositionSide.LONG, 100)
     assert setup.extreme_price == 100
 
 
+def test_forced_take_profit_uses_configured_risk_reward_ratio() -> None:
+    long_tp = be._forced_take_profit(PositionSide.LONG, entry_price=110, stop_loss=100)
+    assert long_tp == pytest.approx(110 + be.TREND_TP_RISK_REWARD_RATIO * 10)
+
+    short_tp = be._forced_take_profit(PositionSide.SHORT, entry_price=90, stop_loss=100)
+    assert short_tp == pytest.approx(90 - be.TREND_TP_RISK_REWARD_RATIO * 10)
+
+
 def test_retracement_zone_price_uses_golden_ratio() -> None:
-    long_setup = be._build_pending_setup(PositionSide.LONG, 100, 200, extreme_price=110)
+    long_setup = be._build_pending_setup(PositionSide.LONG, 100, extreme_price=110)
     assert be._retracement_zone_price(long_setup) == pytest.approx(
         100 + be.RETRACEMENT_RATIO * 10
     )
 
-    short_setup = be._build_pending_setup(PositionSide.SHORT, 100, 50, extreme_price=90)
+    short_setup = be._build_pending_setup(PositionSide.SHORT, 100, extreme_price=90)
     assert be._retracement_zone_price(short_setup) == pytest.approx(
         100 - be.RETRACEMENT_RATIO * 10
     )
 
 
 def test_update_pending_setup_extreme_tracks_most_favorable_price_only() -> None:
-    long_setup = be._build_pending_setup(PositionSide.LONG, 100, 200, extreme_price=105)
+    long_setup = be._build_pending_setup(PositionSide.LONG, 100, extreme_price=105)
     be._update_pending_setup_extreme(long_setup, make_candle(1, 106, 108, 104, 107))
     assert long_setup.extreme_price == 108  # new high extends it
 
     be._update_pending_setup_extreme(long_setup, make_candle(2, 107, 107.5, 103, 104))
     assert long_setup.extreme_price == 108  # a pullback bar doesn't shrink it
 
-    short_setup = be._build_pending_setup(PositionSide.SHORT, 100, 50, extreme_price=95)
+    short_setup = be._build_pending_setup(PositionSide.SHORT, 100, extreme_price=95)
     be._update_pending_setup_extreme(short_setup, make_candle(1, 94, 96, 92, 93))
     assert short_setup.extreme_price == 92  # new low extends it further down
 
@@ -167,9 +175,7 @@ def test_update_pending_setup_extreme_tracks_most_favorable_price_only() -> None
 async def test_try_fill_pending_setup_enters_on_golden_ratio_retracement() -> None:
     # pivot=100, extreme reached=110 -> 61.8% retracement zone = 106.18. Price only pulls back
     # to 104 (nowhere near the original pivot at 100) and the entry should still fill there.
-    setup = be._build_pending_setup(
-        PositionSide.LONG, pivot_price=100, tp_price=200, extreme_price=110
-    )
+    setup = be._build_pending_setup(PositionSide.LONG, pivot_price=100, extreme_price=110)
     candle = make_candle(1, 108, 109, 104, 106)
 
     reversal_time = candle.timestamp + timedelta(minutes=1)
@@ -192,9 +198,7 @@ async def test_try_fill_pending_setup_enters_on_golden_ratio_retracement() -> No
 async def test_try_fill_pending_setup_does_not_touch_zone_before_golden_ratio_retracement() -> None:
     # pivot=100, extreme=120 -> 61.8% retracement zone = 112.36. Price only pulls back to
     # 113 -- short of the zone.
-    setup = be._build_pending_setup(
-        PositionSide.LONG, pivot_price=100, tp_price=200, extreme_price=120
-    )
+    setup = be._build_pending_setup(PositionSide.LONG, pivot_price=100, extreme_price=120)
     candle = make_candle(1, 115, 116, 113, 114)
 
     calls: list[tuple] = []
@@ -210,7 +214,7 @@ async def test_try_fill_pending_setup_does_not_touch_zone_before_golden_ratio_re
 
 
 def test_pending_setup_invalidated_on_body_close_past_stop_loss() -> None:
-    long_setup = be._build_pending_setup(PositionSide.LONG, 100, 120)
+    long_setup = be._build_pending_setup(PositionSide.LONG, 100)
 
     still_valid = make_candle(1, 101, 102, 99, 100.5)
     assert be._pending_setup_invalidated(long_setup, still_valid) is False
@@ -248,7 +252,7 @@ def test_find_1m_reversal_entry_returns_none_when_no_candle_qualifies() -> None:
 
 
 async def test_try_fill_pending_setup_skips_fetch_when_zone_not_touched() -> None:
-    setup = be._build_pending_setup(PositionSide.LONG, 100, 120)
+    setup = be._build_pending_setup(PositionSide.LONG, 100)
     candle = make_candle(1, 105, 106, 103, 104)  # low=103, never reaches zone (100)
 
     calls: list[tuple] = []
@@ -264,7 +268,7 @@ async def test_try_fill_pending_setup_skips_fetch_when_zone_not_touched() -> Non
 
 
 async def test_try_fill_pending_setup_enters_on_1m_reversal() -> None:
-    setup = be._build_pending_setup(PositionSide.LONG, 100, 120)
+    setup = be._build_pending_setup(PositionSide.LONG, 100)
     candle = make_candle(1, 102, 103, 99, 101)  # wicks into the zone
 
     reversal_time = candle.timestamp + timedelta(minutes=1)
@@ -280,15 +284,18 @@ async def test_try_fill_pending_setup_enters_on_1m_reversal() -> None:
 
     opened = await be._try_fill_pending_setup(setup, candle, fetch_1m, 10_000, SETTINGS)
 
+    expected_stop_loss = 100 * (1 - be.SL_BUFFER_PCT)
+    expected_take_profit = 100.7 + be.TREND_TP_RISK_REWARD_RATIO * (100.7 - expected_stop_loss)
+
     assert opened is not None
     assert opened.entry_price == 100.7
     assert opened.entry_time == reversal_time
-    assert opened.stop_loss == pytest.approx(100 * (1 - be.SL_BUFFER_PCT))
-    assert opened.take_profit == 120
+    assert opened.stop_loss == pytest.approx(expected_stop_loss)
+    assert opened.take_profit == pytest.approx(expected_take_profit)
 
 
 async def test_try_fill_pending_setup_returns_none_when_no_reversal_in_window() -> None:
-    setup = be._build_pending_setup(PositionSide.LONG, 100, 120)
+    setup = be._build_pending_setup(PositionSide.LONG, 100)
     candle = make_candle(1, 102, 103, 99, 101)
 
     async def fetch_1m(start, end) -> list[Candle]:
@@ -649,7 +656,9 @@ async def test_simulate_full_uptrend_long_trade_hits_take_profit() -> None:
 
     entry_price = 109.3
     stop_loss = 103 * (1 - be.SL_BUFFER_PCT)
-    take_profit = 134  # most recent confirmed HTF swing high
+    # TP is forced to TREND_TP_RISK_REWARD_RATIO (2:1) times the SL distance from entry,
+    # not the HTF swing high (134) -- so it's reached sooner, at hour 85 instead of 86.
+    take_profit = entry_price + be.TREND_TP_RISK_REWARD_RATIO * (entry_price - stop_loss)
     sizing = calculate_position_size(
         equity=initial_equity,
         entry_price=entry_price,
@@ -665,11 +674,11 @@ async def test_simulate_full_uptrend_long_trade_hits_take_profit() -> None:
     assert position.entry_price == entry_price
     assert position.entry_time == reversal_time
     assert position.stop_loss == pytest.approx(stop_loss)
-    assert position.take_profit == take_profit
+    assert position.take_profit == pytest.approx(take_profit)
     assert position.quantity == pytest.approx(sizing.quantity)
     assert position.pnl == pytest.approx(expected_pnl)
     assert position.is_win is True
-    assert position.exit_time == BASE_TIME + timedelta(hours=86)
+    assert position.exit_time == BASE_TIME + timedelta(hours=85)
 
     assert result.summary.total_trades == 1
     assert result.summary.win_count == 1

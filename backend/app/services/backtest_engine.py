@@ -7,9 +7,13 @@ confirmed, the engine instead tracks the most favorable price reached since
 (the post-pivot extreme) and waits for price to retrace RETRACEMENT_RATIO
 (61.8%, the Fibonacci golden ratio) of the way back toward the pivot -- not
 a full round-trip to the pivot itself -- then looks inside that hour's
-1-minute candles for a reversal-close confirmation before entering. SL/TP
-are unaffected -- they're still derived from the 1h pivot / 4h swing exactly
-as before; only the entry price and timestamp become 1m-precise.
+1-minute candles for a reversal-close confirmation before entering.
+
+Trend-trade TP is a forced TREND_TP_RISK_REWARD_RATIO (2:1) multiple of the
+SL distance from the 1m entry price, not the nearest opposite HTF swing --
+the HTF swing is frequently too far away to realistically reach, so pinning
+TP to a fixed multiple of risk raises the odds of actually hitting it. SL is
+unaffected -- still derived from the 1h pivot exactly as before.
 
 Simplifications (documented, not covered by the spec text):
 - HTF pivots are detected once over the full fetched history and treated as
@@ -71,6 +75,7 @@ RSI_OVERBOUGHT = 70.0
 BOX_PROXIMITY_PCT = 0.005
 TP1_CLOSE_FRACTION = 0.5
 RETRACEMENT_RATIO = 0.618  # Fibonacci golden ratio; fraction of the post-pivot move retraced
+TREND_TP_RISK_REWARD_RATIO = 2.0  # trend-trade TP = entry +/- this multiple of the SL distance
 
 HTF_FETCH_PROGRESS_PCT = 0.0
 LTF_FETCH_PROGRESS_PCT = 15.0
@@ -106,7 +111,6 @@ class _PendingSetup:
 
     side: PositionSide
     pivot_price: float
-    tp_price: float
     stop_loss: float
     extreme_price: float  # most favorable price (high/low) seen since the pivot confirmed
 
@@ -228,20 +232,14 @@ async def simulate(
                 for pivot in confirmed_at.get(i, []):
                     if pivot.type == PivotType.SWING_LOW:
                         pending_setup = _build_pending_setup(
-                            PositionSide.LONG,
-                            pivot.price,
-                            window.recent_sh_price,
-                            extreme_price=candle.high,
+                            PositionSide.LONG, pivot.price, extreme_price=candle.high
                         )
                         break
             elif window.trend == TrendState.DOWNTREND:
                 for pivot in confirmed_at.get(i, []):
                     if pivot.type == PivotType.SWING_HIGH:
                         pending_setup = _build_pending_setup(
-                            PositionSide.SHORT,
-                            pivot.price,
-                            window.recent_sl_price,
-                            extreme_price=candle.low,
+                            PositionSide.SHORT, pivot.price, extreme_price=candle.low
                         )
                         break
             elif i > 0:
@@ -332,16 +330,21 @@ def _setup_matches_trend(setup: _PendingSetup, trend: TrendState) -> bool:
 def _build_pending_setup(
     side: PositionSide,
     pivot_price: float,
-    tp_price: float,
     extreme_price: float | None = None,
 ) -> _PendingSetup:
     return _PendingSetup(
         side=side,
         pivot_price=pivot_price,
-        tp_price=tp_price,
         stop_loss=_trend_stop_loss(side, pivot_price),
         extreme_price=extreme_price if extreme_price is not None else pivot_price,
     )
+
+
+def _forced_take_profit(side: PositionSide, entry_price: float, stop_loss: float) -> float:
+    risk = abs(entry_price - stop_loss)
+    if side == PositionSide.LONG:
+        return entry_price + TREND_TP_RISK_REWARD_RATIO * risk
+    return entry_price - TREND_TP_RISK_REWARD_RATIO * risk
 
 
 def _update_pending_setup_extreme(setup: _PendingSetup, candle: Candle) -> None:
@@ -383,11 +386,12 @@ async def _try_fill_pending_setup(
         return None
 
     entry_price, entry_time = entry
+    tp_price = _forced_take_profit(setup.side, entry_price, setup.stop_loss)
     return _try_open_trend_trade(
         side=setup.side,
         entry_price=entry_price,
         pivot_price=setup.pivot_price,
-        tp_price=setup.tp_price,
+        tp_price=tp_price,
         entry_time=entry_time,
         equity=equity,
         settings=settings,
