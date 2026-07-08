@@ -5,7 +5,7 @@ Trend-trade entries are further refined with a 1-minute timing layer: once
 the LTF (1h) pivot ("OB") that would normally trigger an immediate entry is
 confirmed, the engine instead tracks the most favorable price reached since
 (the post-pivot extreme) and waits for price to retrace RETRACEMENT_RATIO
-(61.8%, the Fibonacci golden ratio) of the way back toward the pivot -- not
+(50%, a simple half retracement) of the way back toward the pivot -- not
 a full round-trip to the pivot itself -- then looks inside that hour's
 1-minute candles for a reversal-close confirmation before entering.
 
@@ -74,7 +74,7 @@ RSI_OVERSOLD = 30.0
 RSI_OVERBOUGHT = 70.0
 BOX_PROXIMITY_PCT = 0.005
 TP1_CLOSE_FRACTION = 0.5
-RETRACEMENT_RATIO = 0.618  # Fibonacci golden ratio; fraction of the post-pivot move retraced
+RETRACEMENT_RATIO = 0.5  # fraction of the post-pivot move retraced before entry is armed
 TREND_TP_RISK_REWARD_RATIO = 2.0  # trend-trade TP = entry +/- this multiple of the SL distance
 
 HTF_FETCH_PROGRESS_PCT = 0.0

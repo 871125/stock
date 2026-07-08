@@ -147,7 +147,7 @@ def test_forced_take_profit_uses_configured_risk_reward_ratio() -> None:
     assert short_tp == pytest.approx(90 - be.TREND_TP_RISK_REWARD_RATIO * 10)
 
 
-def test_retracement_zone_price_uses_golden_ratio() -> None:
+def test_retracement_zone_price_uses_configured_ratio() -> None:
     long_setup = be._build_pending_setup(PositionSide.LONG, 100, extreme_price=110)
     assert be._retracement_zone_price(long_setup) == pytest.approx(
         100 + be.RETRACEMENT_RATIO * 10
@@ -570,8 +570,8 @@ def _uptrend_htf_candles() -> list[Candle]:
 def _uptrend_ltf_candles() -> list[Candle]:
     # Starts after the HTF uptrend is confirmed (hour 76). Forms one LTF swing low ("OB")
     # at hour 79 (confirmed at hour 81 with LTF_PIVOT_LOOKBACK=2). The post-pivot extreme
-    # climbs to 112 (hour 82's high), so the 61.8% (golden ratio) retracement zone sits at
-    # 103 + 0.618*(112-103) = 108.562 -- hour 82's low (108) already reaches it, which is
+    # climbs to 112 (hour 82's high), so the 50% retracement zone sits at
+    # 103 + 0.5*(112-103) = 107.5 -- hour 82's low (107) already reaches it, which is
     # where the 1m reversal-close entry fires (see the fetch_1m stub in the test), well
     # before price would have fully round-tripped back to the pivot itself (103, touched at
     # hour 83). Price then rallies to the HTF take-profit target (134) by hour 86.
@@ -580,12 +580,12 @@ def _uptrend_ltf_candles() -> list[Candle]:
         (78, 106, 108, 106, 107),
         (79, 103, 105, 103, 104),  # swing low candidate, low=103
         (80, 105, 107, 105, 106),
-        (81, 108, 110, 108, 109.5),  # confirmation bar; extreme=110, zone=107.326, not touched
-        (82, 109, 112, 108, 111),  # extreme updates to 112, zone=108.562 -> touched (low=108)
+        (81, 108, 110, 108, 109.5),  # confirmation bar; extreme=110, zone=106.5, not touched
+        (82, 109, 112, 107, 111),  # extreme updates to 112, zone=107.5 -> touched (low=107)
         (83, 110, 111, 103, 110.5),
-        (84, 112, 120, 111, 119),
+        (84, 112, 120, 111, 119),  # high >= 118.506 -> take profit
         (85, 120, 128, 119, 127),
-        (86, 128, 136, 127, 134),  # high >= 134 -> take profit
+        (86, 128, 136, 127, 134),
     ]
     return [
         Candle(
@@ -605,26 +605,26 @@ async def test_simulate_full_uptrend_long_trade_hits_take_profit() -> None:
     ltf_candles = _uptrend_ltf_candles()
     initial_equity = 10_000.0
 
-    zone_touch_candle = ltf_candles[5]  # hour 82, where the 61.8% zone (108.562) is reached
+    zone_touch_candle = ltf_candles[5]  # hour 82, where the 50% zone (107.5) is reached
     assert zone_touch_candle.timestamp == BASE_TIME + timedelta(hours=82)
     reversal_time = zone_touch_candle.timestamp + timedelta(minutes=1)
     one_minute_candles = [
         # First minute: touches the zone but closes bearish -> not yet a reversal.
         Candle(
             timestamp=zone_touch_candle.timestamp,
-            open=109.0,
-            high=109.2,
-            low=108.3,
-            close=108.7,
+            open=108.0,
+            high=108.2,
+            low=107.3,
+            close=107.7,
             volume=1.0,
         ),
         # Second minute: touches the zone and closes bullish -> reversal entry.
         Candle(
             timestamp=reversal_time,
-            open=108.7,
-            high=109.5,
-            low=108.4,
-            close=109.3,
+            open=107.7,
+            high=108.5,
+            low=107.4,
+            close=108.1,
             volume=1.0,
         ),
     ]
@@ -637,7 +637,7 @@ async def test_simulate_full_uptrend_long_trade_hits_take_profit() -> None:
 
     result = await be.simulate("BTC-USDT", htf_candles, ltf_candles, initial_equity, fetch_1m)
 
-    # fetch_1m is only called once: when the 61.8% retracement zone is first reached (hour 82).
+    # fetch_1m is only called once: when the 50% retracement zone is first reached (hour 82).
     assert fetch_calls == [
         (zone_touch_candle.timestamp, zone_touch_candle.timestamp + timedelta(hours=1))
     ]
@@ -654,10 +654,10 @@ async def test_simulate_full_uptrend_long_trade_hits_take_profit() -> None:
     assert len(result.positions) == 1
     position = result.positions[0]
 
-    entry_price = 109.3
+    entry_price = 108.1
     stop_loss = 103 * (1 - be.SL_BUFFER_PCT)
     # TP is forced to TREND_TP_RISK_REWARD_RATIO (2:1) times the SL distance from entry,
-    # not the HTF swing high (134) -- so it's reached sooner, at hour 85 instead of 86.
+    # not the HTF swing high (134) -- so it's reached sooner, at hour 84 instead of 86.
     take_profit = entry_price + be.TREND_TP_RISK_REWARD_RATIO * (entry_price - stop_loss)
     sizing = calculate_position_size(
         equity=initial_equity,
@@ -678,7 +678,7 @@ async def test_simulate_full_uptrend_long_trade_hits_take_profit() -> None:
     assert position.quantity == pytest.approx(sizing.quantity)
     assert position.pnl == pytest.approx(expected_pnl)
     assert position.is_win is True
-    assert position.exit_time == BASE_TIME + timedelta(hours=85)
+    assert position.exit_time == BASE_TIME + timedelta(hours=84)
 
     assert result.summary.total_trades == 1
     assert result.summary.win_count == 1
