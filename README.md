@@ -85,6 +85,8 @@ npm run lint
 > 검증하면서 몇 가지는 바뀌었습니다(예: 되돌림 진입 방식). 헷갈리지 않도록
 > 이 섹션이 "지금 실제로 도는 코드" 기준의 최신 정리본입니다. 파라미터는
 > 전부 `backend/app/services/backtest_engine.py` 상단 상수값입니다.
+> 각 파라미터를 왜 이 값으로 정했는지는 [`docs/backtest_results.md`](docs/backtest_results.md)
+> (백테스트 실험 기록)를 참고하세요.
 
 ### 1. 변곡점(Swing High/Low) 탐지 — `pivot.py`
 
