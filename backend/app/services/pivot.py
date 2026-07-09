@@ -53,7 +53,12 @@ def detect_pivots(candles: list[Candle], lookback: int) -> list[PivotPoint]:
     sequence_no = 0
 
     for index, types in enumerate(_raw_candidates(candles, lookback)):
+        if not types:
+            continue
         candle = candles[index]
+        # types is only non-empty for index in [lookback, n-lookback), so
+        # index + lookback is always a valid position in `candles` here.
+        confirmed_timestamp = candles[index + lookback].timestamp
 
         for pivot_type in types:
             price = candle.high if pivot_type == PivotType.SWING_HIGH else candle.low
@@ -69,6 +74,7 @@ def detect_pivots(candles: list[Candle], lookback: int) -> list[PivotPoint]:
                     confirmed[-1] = PivotPoint(
                         index=index,
                         timestamp=candle.timestamp,
+                        confirmed_timestamp=confirmed_timestamp,
                         price=price,
                         type=pivot_type,
                         sequence_no=current.sequence_no,
@@ -80,6 +86,7 @@ def detect_pivots(candles: list[Candle], lookback: int) -> list[PivotPoint]:
                 PivotPoint(
                     index=index,
                     timestamp=candle.timestamp,
+                    confirmed_timestamp=confirmed_timestamp,
                     price=price,
                     type=pivot_type,
                     sequence_no=sequence_no,

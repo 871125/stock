@@ -24,10 +24,22 @@ def make_candle(
     )
 
 
-def make_pivot(seq: int, hours: int, pivot_type: PivotType, price: float) -> PivotPoint:
+# Default matches HTF_PIVOT_LOOKBACK(2) * 4h candles -- a pivot isn't
+# confirmable until that many candles after its own candle are seen.
+_DEFAULT_CONFIRM_DELAY_HOURS = 8
+
+
+def make_pivot(
+    seq: int,
+    hours: int,
+    pivot_type: PivotType,
+    price: float,
+    confirm_delay_hours: int = _DEFAULT_CONFIRM_DELAY_HOURS,
+) -> PivotPoint:
     return PivotPoint(
         index=hours,
         timestamp=BASE_TIME + timedelta(hours=hours),
+        confirmed_timestamp=BASE_TIME + timedelta(hours=hours + confirm_delay_hours),
         price=price,
         type=pivot_type,
         sequence_no=seq,
@@ -50,14 +62,20 @@ def test_build_trend_windows_and_lookup_uptrend() -> None:
     assert windows[0].trend == TrendState.UPTREND
     assert windows[0].recent_sl_price == 110
     assert windows[0].recent_sh_price == 130
-    assert windows[0].effective_from == pivots[3].timestamp
+    # effective_from is when pivots[3] is *confirmable*, not its own candle's
+    # timestamp -- otherwise the window would be "effective" before the data
+    # that justifies it (a live bot couldn't have known this at pivots[3].timestamp).
+    assert windows[0].effective_from == pivots[3].confirmed_timestamp
+    assert windows[0].effective_from == BASE_TIME + timedelta(hours=12 + 8)
 
     timestamps = [w.effective_from for w in windows]
 
-    before = be._trend_window_at(windows, timestamps, BASE_TIME)
-    assert before is None
+    before = be._trend_window_at(windows, timestamps, pivots[3].timestamp)
+    assert before is None  # not yet confirmable at the pivot's own candle
 
-    at_or_after = be._trend_window_at(windows, timestamps, pivots[3].timestamp + timedelta(hours=1))
+    at_or_after = be._trend_window_at(
+        windows, timestamps, pivots[3].confirmed_timestamp + timedelta(hours=1)
+    )
     assert at_or_after is windows[0]
 
 
@@ -658,6 +676,15 @@ def test_max_drawdown_pct_zero_when_always_rising() -> None:
 # ---- simulate() end-to-end ------------------------------------------------------------------
 
 
+# The HTF sequence starts well before BASE_TIME so its last pivot (index 19,
+# confirmed at index 21) is *confirmable* -- i.e. its confirmed_timestamp,
+# not just its own candle's timestamp -- before hour 77, when the LTF fixture
+# below starts. Without this lead-in the uptrend window wouldn't be
+# "effective" yet when the LTF entry logic needs it (see the pivot
+# confirmation-timestamp fix in pivot.py / trading_logic.py).
+_HTF_LEAD_IN_HOURS = 20
+
+
 def _uptrend_htf_candles() -> list[Candle]:
     # 4h levels forming a clean HL/HH zigzag: SL=100, SH=125, SL=105 (HL), SH=133 (HH).
     # Verified by hand: strict local extrema over a +/-2 candle window (HTF_PIVOT_LOOKBACK).
@@ -687,7 +714,7 @@ def _uptrend_htf_candles() -> list[Candle]:
     ]
     return [
         Candle(
-            timestamp=BASE_TIME + timedelta(hours=4 * i),
+            timestamp=BASE_TIME - timedelta(hours=_HTF_LEAD_IN_HOURS) + timedelta(hours=4 * i),
             open=level,
             high=level + 1,
             low=level - 1,

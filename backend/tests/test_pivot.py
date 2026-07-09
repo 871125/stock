@@ -46,6 +46,62 @@ def test_basic_alternating_pivots() -> None:
     assert [p.sequence_no for p in pivots] == [1, 2, 3, 4]
 
 
+def test_confirmed_timestamp_is_lookback_candles_after_the_pivot() -> None:
+    """A pivot at index i can't be identified until `lookback` candles after
+    it are seen -- confirmed_timestamp must reflect that, not the pivot
+    candle's own (earlier) timestamp, otherwise anything gating a decision on
+    "this pivot exists" would be using data from before it existed."""
+    candles = make_candles(
+        [
+            (10, 10, 9, 9.5),  # 0 edge
+            (10, 11, 9, 10.5),  # 1
+            (11, 14, 10, 13.5),  # 2 SH
+            (13, 12, 8, 8.5),  # 3 SL
+            (9, 13, 9, 12.5),  # 4
+            (12, 17, 10, 16.5),  # 5 SH
+            (16, 15, 9, 9.5),  # 6 SL
+            (9, 11, 11, 10.5),  # 7
+            (10, 10, 9, 9.5),  # 8 edge
+        ]
+    )
+
+    pivots = detect_pivots(candles, lookback=1)
+
+    assert [p.timestamp for p in pivots] == [
+        BASE_TIME + timedelta(hours=2),
+        BASE_TIME + timedelta(hours=3),
+        BASE_TIME + timedelta(hours=5),
+        BASE_TIME + timedelta(hours=6),
+    ]
+    # confirmed_timestamp is exactly `lookback` (1) hour after each pivot's own candle.
+    assert [p.confirmed_timestamp for p in pivots] == [
+        BASE_TIME + timedelta(hours=3),
+        BASE_TIME + timedelta(hours=4),
+        BASE_TIME + timedelta(hours=6),
+        BASE_TIME + timedelta(hours=7),
+    ]
+
+
+def test_confirmed_timestamp_recomputed_when_pivot_updates_to_more_extreme() -> None:
+    candles = make_candles(
+        [
+            (9, 8, 7, 7.5),  # 0 edge
+            (9, 10, 8, 9.5),  # 1
+            (9, 14, 9, 13.5),  # 2 SH candidate (14), lower than pivot at 4
+            (11, 12, 9.5, 11.5),  # 3 neutral
+            (12, 18, 9.5, 17.5),  # 4 SH candidate (18), replaces pivot 2
+            (11, 11, 8, 8.5),  # 5 edge
+        ]
+    )
+
+    pivots = detect_pivots(candles, lookback=1)
+
+    assert len(pivots) == 1
+    assert pivots[0].index == 4
+    # Recomputed against the *new* (index 4) pivot, not left over from index 2.
+    assert pivots[0].confirmed_timestamp == BASE_TIME + timedelta(hours=5)
+
+
 def test_consecutive_same_side_updates_to_more_extreme() -> None:
     candles = make_candles(
         [

@@ -109,7 +109,11 @@ def build_htf_trend_windows(pivots: list[PivotPoint]) -> list[TrendWindow]:
         )
         windows.append(
             TrendWindow(
-                effective_from=pivots[i].timestamp,
+                # Use confirmed_timestamp, not timestamp -- the trend can't be
+                # known until pivots[i] itself is confirmable (lookback candles
+                # after its own candle), otherwise this window would claim to be
+                # "effective" before the data that justifies it even exists yet.
+                effective_from=pivots[i].confirmed_timestamp,
                 trend=trend,
                 recent_sl_price=recent_sl.price,
                 recent_sh_price=recent_sh.price,

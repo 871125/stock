@@ -12,6 +12,7 @@ def make_pivot(seq: int, pivot_type: PivotType, price: float) -> PivotPoint:
     return PivotPoint(
         index=seq,
         timestamp=BASE_TIME + timedelta(hours=seq),
+        confirmed_timestamp=BASE_TIME + timedelta(hours=seq),
         price=price,
         type=pivot_type,
         sequence_no=seq,

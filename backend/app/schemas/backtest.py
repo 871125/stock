@@ -37,7 +37,12 @@ class Candle(BaseModel):
 
 class PivotPoint(BaseModel):
     index: int
-    timestamp: datetime
+    timestamp: datetime  # the pivot candle's own timestamp
+    # When this pivot becomes verifiable, i.e. the timestamp of the candle at
+    # index + lookback -- a pivot can't be identified until that many candles
+    # after it are seen, so anything gating a decision on "this pivot exists"
+    # must wait until this time, not `timestamp` (see pivot.py / trading_logic.py).
+    confirmed_timestamp: datetime
     price: float
     type: PivotType
     sequence_no: int
