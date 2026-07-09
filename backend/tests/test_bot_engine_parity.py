@@ -13,11 +13,13 @@ same data through app/bot/engine.py's functions and asserts the same numbers.
 """
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 from app.bot import engine
 from app.bot.state import BotState
+from app.core.config import Settings
 from app.schemas.backtest import Candle, PositionSide, TrendState
 from app.services.bingx_trade_client import OrderResult
 from app.services.pivot import detect_pivots
@@ -27,7 +29,7 @@ from app.services.trading_logic import (
     build_htf_trend_windows,
     trend_window_at,
 )
-from tests.test_backtest_engine import SETTINGS, _uptrend_htf_candles, _uptrend_ltf_candles
+from tests.test_backtest_engine import _uptrend_htf_candles, _uptrend_ltf_candles
 
 
 class _NullNotifier:
@@ -75,8 +77,12 @@ class _FakeTradeClient:
         return OrderResult(order_id=f"tp-{len(self.placed_orders)}", status="NEW")
 
 
-async def test_bot_engine_matches_backtest_uptrend_entry(monkeypatch) -> None:
+async def test_bot_engine_matches_backtest_uptrend_entry(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(engine, "TREND_TP_HYBRID_MODE", False)
+    # bot_state_dir must be isolated from the real `state/` dir -- engine._try_arm_pending_setup
+    # / _advance_pending_setup call save() as a side effect, and the real dir is what the live
+    # bot reads on startup (a leaked "BTC-USDT.state.json" here would look like a real position).
+    settings = Settings(risk_per_trade_pct=0.01, leverage=10, bot_state_dir=str(tmp_path))
 
     htf_candles = _uptrend_htf_candles()
     ltf_candles = _uptrend_ltf_candles()
@@ -98,7 +104,7 @@ async def test_bot_engine_matches_backtest_uptrend_entry(monkeypatch) -> None:
     ltf_pivots = detect_pivots(closed_through_confirmation, LTF_PIVOT_LOOKBACK)
     state = BotState(symbol="BTC-USDT")
     await engine._try_arm_pending_setup(
-        state, SETTINGS, closed_through_confirmation, ltf_pivots, window, _NullNotifier()
+        state, settings, closed_through_confirmation, ltf_pivots, window, _NullNotifier()
     )
 
     assert state.pending_setup is not None
@@ -135,7 +141,7 @@ async def test_bot_engine_matches_backtest_uptrend_entry(monkeypatch) -> None:
     now = datetime.now(UTC)
 
     await engine._advance_pending_setup(
-        state, "BTC-USDT", SETTINGS, current_candle, now, fake_market, fake_trade, _NullNotifier()
+        state, "BTC-USDT", settings, current_candle, now, fake_market, fake_trade, _NullNotifier()
     )
 
     assert state.pending_setup is None
@@ -163,3 +169,6 @@ async def test_bot_engine_matches_backtest_uptrend_entry(monkeypatch) -> None:
     assert stop_orders[0][2] == pytest.approx(expected_stop_loss)
     assert len(tp_orders) == 1
     assert tp_orders[0][2] == pytest.approx(expected_take_profit)
+
+    # State was written to the isolated tmp dir, not the real state/ dir.
+    assert (tmp_path / "BTC-USDT.state.json").exists()
