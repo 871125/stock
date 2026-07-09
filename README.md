@@ -8,6 +8,8 @@
 
 ```
 backend/    FastAPI 백엔드 (백테스트 엔진, BingX 데이터 연동)
+  app/services/trading_logic.py  매매 판단 로직 (백테스트/봇 공용)
+  app/bot/                       실거래 봇 (독립 프로세스)
 frontend/   React + Vite 프론트엔드 (백테스트 UI)
 docs/       매매 로직 명세서
 ```
@@ -78,15 +80,52 @@ npm run build
 npm run lint
 ```
 
+## 실거래 봇 실행 (bot)
+
+`backend/app/bot`에 있는 상시 실행 봇입니다. 백테스트 API 서버(uvicorn)와는
+완전히 별개의 독립 프로세스로, 한 번에 한 심볼만 거래합니다. 매매 판단
+로직은 `app/services/trading_logic.py`를 백테스트 엔진과 **그대로 공유**하므로
+(별도로 재구현하지 않음) 여기서 파라미터를 튜닝하면 봇에도 자동으로
+반영됩니다 — 자세한 설계 이유는 `trading_logic.py`의 모듈 docstring 참고.
+
+```bash
+cd backend
+cp .env.example .env   # 아직 안 했다면
+# .env에 BINGX_API_KEY/SECRET, TELEGRAM_BOT_TOKEN/CHAT_ID, BOT_SYMBOL 채우기
+python -m app.bot.run
+```
+
+- **반드시 `BINGX_USE_VST=true`(기본값, 모의투자)로 먼저 검증한 뒤에 실전
+  전환**하세요. VST는 실계좌와 별개로 발급받는 데모 API 키를 씁니다
+  (`BINGX_API_KEY`/`SECRET`에 그 데모 키를 넣어야 함). 실전으로 바꿀 때는
+  `BINGX_USE_VST=false`로 바꾸고 키도 실계좌 키로 교체하세요.
+- **투자금은 매 진입 직전 계좌의 사용가능잔액을 조회해서 그 시점 값을
+  그대로 사용**합니다 (별도 자본 배분 없음 — 리스크 자체는 여전히 잔액의
+  1%로 제한됨, `risk_per_trade_pct`).
+- 텔레그램으로 봇 시작/종료, 대기 셋업 발생, 진입 체결, 부분 익절, 포지션
+  종료, 처리되지 않은 오류를 알림받습니다. `TELEGRAM_BOT_TOKEN`/
+  `TELEGRAM_CHAT_ID`를 비워두면 알림 없이도 동작은 합니다(콘솔 로그만).
+- 상태는 `state/{symbol}.state.json`에 저장돼 재시작해도 이어서 진행합니다
+  (`.gitignore`에 이미 등록돼 있어 커밋되지 않음).
+- BingX 인증 거래 API(`app/services/bingx_trade_client.py`)의 정확한
+  엔드포인트/파라미터는 BingX 공식 문서 기준으로 작성했지만 VST로 직접
+  검증 전까지는 완전히 확정된 게 아닙니다 — 잘못된 값은 조용히 실패하지
+  않고 에러를 던지므로(주문 누락 없이) VST에서 반복 검증하며 다듬는 걸
+  전제로 합니다.
+- 원웨이 포지션 모드(`positionSide=BOTH`)를 가정합니다. BingX 계정이
+  헤지 모드로 돼 있으면 계정 설정에서 원웨이로 바꿔야 합니다.
+
 ## 매매 로직 상세 (현재 구현 상태)
 
 > 아래는 **지금 코드에 실제로 구현되어 있는 로직**을 정리한 것입니다.
 > [`docs/spec.md`](docs/spec.md)는 최초 설계 명세서이고, 그 이후 백테스트로
 > 검증하면서 몇 가지는 바뀌었습니다(예: 되돌림 진입 방식). 헷갈리지 않도록
 > 이 섹션이 "지금 실제로 도는 코드" 기준의 최신 정리본입니다. 파라미터는
-> 전부 `backend/app/services/backtest_engine.py` 상단 상수값입니다.
-> 각 파라미터를 왜 이 값으로 정했는지는 [`docs/backtest_results.md`](docs/backtest_results.md)
-> (백테스트 실험 기록)를 참고하세요.
+> 전부 `backend/app/services/trading_logic.py` 상단 상수값입니다 — 백테스트
+> 엔진(`backtest_engine.py`)과 실거래 봇(`app/bot`)이 이 상수/판단 함수를
+> 그대로 공유합니다. 각 파라미터를 왜 이 값으로 정했는지는
+> [`docs/backtest_results.md`](docs/backtest_results.md)(백테스트 실험 기록)를
+> 참고하세요.
 
 ### 1. 변곡점(Swing High/Low) 탐지 — `pivot.py`
 
@@ -153,7 +192,7 @@ HTF가 횡보(Consolidation)로 판정되면 LTF에서 RSI(14) 기반 박스권 
 
 ### 9. 알려진 단순화 / 제약사항
 
-- HTF/LTF 변곡점은 전체 구간을 한 번에 계산 후 "확정된 시점(index+lookback)"부터 안 것으로 취급. 실시간 봇처럼 미확정 변곡점을 매 틱 갱신하며 추적하지 않음 (명세서 6.2의 상태 지속성은 봇 단계에서 별도 구현 필요).
+- HTF/LTF 변곡점은 전체 구간을 한 번에 계산 후 "확정된 시점(index+lookback)"부터 안 것으로 취급. 실거래 봇(`app/bot`)은 매 틱 미확정 변곡점을 증분 추적하는 대신, 매 폴링마다 최근 구간을 다시 배치로 재계산하는 더 단순한 방식을 씀 (명세서 6.2의 상태 지속성 자체는 `app/bot/state.py`로 구현됨).
 - 동시 포지션은 1개로 제한 (대기 중인 진입 셋업도 1개까지).
 - 백테스트 구간 끝에 포지션이 열려있으면 마지막 캔들 종가로 강제 청산.
 - 표본이 적은 기간(1~3개월, 수십 건)에서는 승률/손익이 소수의 큰 승리 거래에 크게 좌우되므로, 짧은 기간 비교 결과의 통계적 신뢰도는 낮음 — 되도록 6개월~1년 단위로 검증 권장.

@@ -266,14 +266,10 @@ def test_forced_take_profit_uses_configured_risk_reward_ratio() -> None:
 
 def test_retracement_zone_price_uses_configured_ratio() -> None:
     long_setup = be._build_pending_setup(PositionSide.LONG, 100, extreme_price=110)
-    assert be._retracement_zone_price(long_setup) == pytest.approx(
-        100 + be.RETRACEMENT_RATIO * 10
-    )
+    assert be._retracement_zone_price(long_setup) == pytest.approx(100 + be.RETRACEMENT_RATIO * 10)
 
     short_setup = be._build_pending_setup(PositionSide.SHORT, 100, extreme_price=90)
-    assert be._retracement_zone_price(short_setup) == pytest.approx(
-        100 - be.RETRACEMENT_RATIO * 10
-    )
+    assert be._retracement_zone_price(short_setup) == pytest.approx(100 - be.RETRACEMENT_RATIO * 10)
 
 
 def test_update_pending_setup_extreme_tracks_most_favorable_price_only() -> None:
@@ -297,9 +293,7 @@ async def test_try_fill_pending_setup_enters_on_golden_ratio_retracement() -> No
 
     reversal_time = candle.timestamp + timedelta(minutes=1)
     one_minute_candles = [
-        Candle(
-            timestamp=reversal_time, open=104.2, high=105.5, low=104.0, close=105.2, volume=1
-        ),
+        Candle(timestamp=reversal_time, open=104.2, high=105.5, low=104.0, close=105.2, volume=1),
     ]
 
     async def fetch_1m(start, end) -> list[Candle]:
@@ -668,8 +662,28 @@ def _uptrend_htf_candles() -> list[Candle]:
     # 4h levels forming a clean HL/HH zigzag: SL=100, SH=125, SL=105 (HL), SH=133 (HH).
     # Verified by hand: strict local extrema over a +/-2 candle window (HTF_PIVOT_LOOKBACK).
     levels = [
-        110, 108, 105, 102, 100, 103, 107, 112, 118, 125, 120,
-        115, 111, 108, 105, 108, 112, 118, 125, 133, 128, 124,
+        110,
+        108,
+        105,
+        102,
+        100,
+        103,
+        107,
+        112,
+        118,
+        125,
+        120,
+        115,
+        111,
+        108,
+        105,
+        108,
+        112,
+        118,
+        125,
+        133,
+        128,
+        124,
     ]
     return [
         Candle(
