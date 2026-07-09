@@ -46,6 +46,38 @@ async def test_get_available_balance_signs_request_and_parses_response() -> None
     assert "signature" in seen["query"]
 
 
+async def test_signature_is_valid_for_the_exact_query_string_sent() -> None:
+    """Regression test: the signature must match the literal bytes BingX will
+    receive. A prior bug signed params in sorted-key order but sent them in
+    dict-insertion order, producing a signature that didn't match what was
+    actually transmitted -- BingX rejects this with "signature mismatch"
+    even though each individual param value was correct.
+    """
+    secret = "my-secret"
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["raw_query"] = request.url.query.decode()
+        return httpx.Response(200, json={"code": 0, "msg": "", "data": {}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url=_BASE_URL) as http_client:
+        client = BingXTradeClient(http_client=http_client)
+        client._api_secret = secret
+        await client.set_leverage("BTC-USDT", 20)
+
+    raw_query = seen["raw_query"]
+    unsigned_part, _, sent_signature = raw_query.rpartition("&signature=")
+    expected_signature = hmac.new(
+        secret.encode(), unsigned_part.encode(), hashlib.sha256
+    ).hexdigest()
+
+    assert sent_signature == expected_signature
+    # The insertion order (symbol, side, leverage) differs from ascending key
+    # order (leverage, side, symbol) -- so this also pins down the ordering.
+    assert unsigned_part.startswith("leverage=20&side=BOTH&symbol=BTC-USDT&timestamp=")
+
+
 async def test_place_market_order_parses_order_result() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         query = dict(httpx.QueryParams(request.url.query))

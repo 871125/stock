@@ -29,7 +29,6 @@ import hashlib
 import hmac
 import time
 from dataclasses import dataclass
-from urllib.parse import urlencode
 
 import httpx
 
@@ -61,8 +60,11 @@ class PositionInfo:
 
 def sign_params(secret: str, params: dict[str, str]) -> str:
     """HMAC-SHA256 signature over params joined in ascending key order."""
-    query_string = "&".join(f"{key}={params[key]}" for key in sorted(params))
-    return hmac.new(secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+    return hmac.new(secret.encode(), _signing_string(params).encode(), hashlib.sha256).hexdigest()
+
+
+def _signing_string(params: dict[str, str]) -> str:
+    return "&".join(f"{key}={params[key]}" for key in sorted(params))
 
 
 class BingXTradeClient:
@@ -76,7 +78,12 @@ class BingXTradeClient:
     async def _request(self, method: str, path: str, params: dict[str, str]) -> dict:
         signed = dict(params)
         signed["timestamp"] = str(int(time.time() * 1000))
-        signed["signature"] = sign_params(self._api_secret, signed)
+        # The signature must be computed over -- and sent in -- the exact same
+        # key order (ascending), since BingX verifies the HMAC against the
+        # literal query string it receives rather than re-sorting server-side.
+        query_string = _signing_string(signed)
+        signature = sign_params(self._api_secret, signed)
+        query_string += f"&signature={signature}"
 
         client = self._http_client or httpx.AsyncClient(base_url=self._base_url, timeout=10.0)
         owns_client = self._http_client is None
@@ -84,7 +91,7 @@ class BingXTradeClient:
             response = await client.request(
                 method,
                 path,
-                params=urlencode(signed),
+                params=query_string,
                 headers={"X-BX-APIKEY": self._api_key},
             )
             response.raise_for_status()
