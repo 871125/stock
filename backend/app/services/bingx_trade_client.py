@@ -39,6 +39,7 @@ _BALANCE_PATH = "/openApi/swap/v2/user/balance"
 _LEVERAGE_PATH = "/openApi/swap/v2/trade/leverage"
 _ORDER_PATH = "/openApi/swap/v2/trade/order"
 _POSITIONS_PATH = "/openApi/swap/v2/user/positions"
+_POSITION_MODE_PATH = "/openApi/swap/v1/positionSide/dual"
 
 _ONE_WAY_POSITION_SIDE = "BOTH"
 
@@ -228,6 +229,17 @@ class BingXTradeClient:
                     entry_price=_maybe_float(position.get("avgPrice")),
                 )
         return None
+
+    async def get_position_mode_is_hedged(self) -> bool:
+        data = await self._request("GET", _POSITION_MODE_PATH, {})
+        return str(data.get("dualSidePosition")).lower() == "true"
+
+    async def set_position_mode_hedged(self, hedged: bool) -> None:
+        await self._request(
+            "POST",
+            _POSITION_MODE_PATH,
+            {"dualSidePosition": "true" if hedged else "false"},
+        )
 
 
 def _maybe_float(value: object) -> float | None:
