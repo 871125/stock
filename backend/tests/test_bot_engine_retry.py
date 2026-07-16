@@ -24,7 +24,7 @@ async def _poll_once_stub_factory(monkeypatch, outcomes):
     exception instance to raise, or None to succeed."""
     calls = {"count": 0}
 
-    async def fake_poll_once(state, symbol, settings, market_client, trade_client, notifier):
+    async def fake_poll_once(state, symbol, settings, market_client, trade_client, notifier, cache):
         calls["count"] += 1
         outcome = outcomes.pop(0)
         if outcome is not None:
@@ -49,7 +49,9 @@ async def test_transient_error_recovers_after_retries(monkeypatch):
     calls = await _poll_once_stub_factory(monkeypatch, outcomes)
     sleeps = await _no_sleep(monkeypatch)
 
-    await engine._poll_once_with_retry(None, "BTC-USDT", None, None, None, _NullNotifier())
+    await engine._poll_once_with_retry(
+        None, "BTC-USDT", None, None, None, _NullNotifier(), engine._MarketDataCache()
+    )
 
     assert calls["count"] == 2
     assert sleeps == [2.0]  # one retry backoff, no notification needed
@@ -63,9 +65,24 @@ async def test_transient_error_raises_once_retries_exhausted(monkeypatch):
     await _no_sleep(monkeypatch)
 
     with pytest.raises(BingXAPIError):
-        await engine._poll_once_with_retry(None, "BTC-USDT", None, None, None, _NullNotifier())
+        await engine._poll_once_with_retry(
+            None, "BTC-USDT", None, None, None, _NullNotifier(), engine._MarketDataCache()
+        )
 
     assert calls["count"] == engine._TRANSIENT_RETRY_ATTEMPTS + 1
+
+
+async def test_rate_limit_error_recovers_after_retries(monkeypatch):
+    outcomes = [BingXAPIError(100410, "rate limited"), None]
+    calls = await _poll_once_stub_factory(monkeypatch, outcomes)
+    sleeps = await _no_sleep(monkeypatch)
+
+    await engine._poll_once_with_retry(
+        None, "BTC-USDT", None, None, None, _NullNotifier(), engine._MarketDataCache()
+    )
+
+    assert calls["count"] == 2
+    assert sleeps == [2.0]
 
 
 async def test_non_transient_error_raises_immediately(monkeypatch):
@@ -74,7 +91,9 @@ async def test_non_transient_error_raises_immediately(monkeypatch):
     sleeps = await _no_sleep(monkeypatch)
 
     with pytest.raises(BingXAPIError):
-        await engine._poll_once_with_retry(None, "BTC-USDT", None, None, None, _NullNotifier())
+        await engine._poll_once_with_retry(
+            None, "BTC-USDT", None, None, None, _NullNotifier(), engine._MarketDataCache()
+        )
 
     assert calls["count"] == 1
     assert sleeps == []
@@ -85,7 +104,9 @@ async def test_network_read_error_recovers_after_retry(monkeypatch):
     calls = await _poll_once_stub_factory(monkeypatch, outcomes)
     sleeps = await _no_sleep(monkeypatch)
 
-    await engine._poll_once_with_retry(None, "BTC-USDT", None, None, None, _NullNotifier())
+    await engine._poll_once_with_retry(
+        None, "BTC-USDT", None, None, None, _NullNotifier(), engine._MarketDataCache()
+    )
 
     assert calls["count"] == 2
     assert sleeps == [2.0]
@@ -97,7 +118,9 @@ async def test_network_error_raises_once_retries_exhausted(monkeypatch):
     await _no_sleep(monkeypatch)
 
     with pytest.raises(httpx.ConnectError):
-        await engine._poll_once_with_retry(None, "BTC-USDT", None, None, None, _NullNotifier())
+        await engine._poll_once_with_retry(
+            None, "BTC-USDT", None, None, None, _NullNotifier(), engine._MarketDataCache()
+        )
 
     assert calls["count"] == engine._TRANSIENT_RETRY_ATTEMPTS + 1
 

@@ -26,9 +26,17 @@ Pivot confirmation only ever looks at the most recently *closed* LTF candle
 a pivot that confirms while the bot is offline or busy with another setup is
 not retroactively picked up later, same as the backtester would never look
 backward either.
+
+`_MarketDataCache` (see `_refresh_ltf_cache`/`_refresh_htf_cache`) avoids
+re-fetching the full HTF/LTF history on every poll: a closed candle's pivot
+status never changes once computed, so that expensive re-fetch only happens
+when a new hour/4h candle has actually closed, while every poll still cheaply
+re-fetches just enough of the recent window to track the current (forming)
+candle in real time.
 """
 
 import asyncio
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -72,13 +80,22 @@ from app.services.trading_logic import (
 _LTF_LIVE_FETCH_DAYS = 90
 _FILLED_STATUS = "FILLED"
 
+# How far back _refresh_ltf_cache/_refresh_htf_cache look on every poll just to
+# notice the current candle and detect a new close -- generous margin over one
+# candle's worth of time so a slow poll or minor clock skew still sees the
+# latest closed bar, while staying a single unpaginated request (see
+# _MarketDataCache).
+_LTF_RECENT_WINDOW_HOURS = 12
+_HTF_RECENT_WINDOW_HOURS = 48
+
 # BingX-side error codes that are transient (temporary outages on their end,
-# e.g. 109500 "quote service unavailable") rather than a problem with our
-# request -- worth a few quick retries before waking anyone up over Telegram.
-# httpx.TransportError (connection reset mid-read, timeout, DNS blip, etc.) is
-# retried the same way: it's a network-level hiccup, not a code problem, and
-# usually resolves within a few seconds.
-_TRANSIENT_BINGX_CODES = {109500}
+# e.g. 109500 "quote service unavailable", or 100410 "rate limited" -- our own
+# request volume tripping their per-IP/per-key limiter) rather than a problem
+# with our request -- worth a few quick retries before waking anyone up over
+# Telegram. httpx.TransportError (connection reset mid-read, timeout, DNS
+# blip, etc.) is retried the same way: it's a network-level hiccup, not a
+# code problem, and usually resolves within a few seconds.
+_TRANSIENT_BINGX_CODES = {109500, 100410}
 _TRANSIENT_RETRY_ATTEMPTS = 3
 _TRANSIENT_RETRY_BASE_SECONDS = 2.0
 
@@ -118,6 +135,7 @@ async def _poll_loop(
     trade_client: BingXTradeClient,
     notifier: TelegramNotifier,
 ) -> None:
+    cache = _MarketDataCache()
     while True:
         try:
             # Re-checked every poll, not just at startup -- the account can
@@ -126,7 +144,7 @@ async def _poll_loop(
             # 109400 until it's corrected.
             await _ensure_one_way_position_mode(trade_client, notifier)
             await _poll_once_with_retry(
-                state, symbol, settings, market_client, trade_client, notifier
+                state, symbol, settings, market_client, trade_client, notifier, cache
             )
         except Exception as exc:  # noqa: BLE001 -- never let one bad poll kill the bot
             await notifier.send(f"⚠️ 봇 오류: {exc!r}")
@@ -179,6 +197,7 @@ async def _poll_once_with_retry(
     market_client: BingXClient,
     trade_client: BingXTradeClient,
     notifier: TelegramNotifier,
+    cache: "_MarketDataCache",
 ) -> None:
     """Retry `_poll_once` a few times on known-transient BingX errors and on
     network-level hiccups (dropped connection, read timeout, etc.).
@@ -190,7 +209,7 @@ async def _poll_once_with_retry(
     """
     for attempt in range(_TRANSIENT_RETRY_ATTEMPTS + 1):
         try:
-            await _poll_once(state, symbol, settings, market_client, trade_client, notifier)
+            await _poll_once(state, symbol, settings, market_client, trade_client, notifier, cache)
             return
         except BingXAPIError as exc:
             if exc.code not in _TRANSIENT_BINGX_CODES or attempt == _TRANSIENT_RETRY_ATTEMPTS:
@@ -216,6 +235,92 @@ async def _reconcile_on_startup(
         )
 
 
+@dataclass
+class _MarketDataCache:
+    """Per-run cache of HTF/LTF pivots and trend windows, keyed on the most
+    recently *closed* candle seen for each timeframe. Never persisted --
+    correctness only depends on data that's already closed (and therefore
+    immutable), so an empty cache after a restart just forces one full
+    recompute on the first poll, same as before this cache existed."""
+
+    ltf_primed: bool = False
+    ltf_last_closed_ts: datetime | None = None
+    closed_ltf_candles: list[Candle] = field(default_factory=list)
+    ltf_pivots: list[PivotPoint] = field(default_factory=list)
+
+    htf_primed: bool = False
+    htf_last_closed_ts: datetime | None = None
+    trend_windows: list[TrendWindow] = field(default_factory=list)
+    trend_timestamps: list[datetime] = field(default_factory=list)
+
+
+async def _refresh_ltf_cache(
+    cache: _MarketDataCache, market_client: BingXClient, symbol: str, now: datetime
+) -> Candle | None:
+    """Returns the current (possibly still-forming) 1h candle, off a cheap
+    single-page fetch made every poll. `detect_pivots` only ever looks at
+    already-*closed* candles and is a purely local sliding-window computation
+    (see pivot.py), so a closed bar's pivot status can never change once
+    computed -- the expensive `_LTF_LIVE_FETCH_DAYS`-day refetch + pivot
+    recompute only needs to happen when a new hour has actually closed since
+    the last one (about once an hour) instead of on every poll (every 8s
+    while a setup is armed). Returns None if no data is available at all,
+    mirroring the original unconditional-fetch behavior."""
+    recent = await market_client.get_ohlcv(
+        symbol, Timeframe.LTF_1H, now - timedelta(hours=_LTF_RECENT_WINDOW_HOURS), now
+    )
+    if not recent:
+        return None
+
+    closed_recent = [c for c in recent if _is_closed(c, now)]
+    latest_closed_ts = closed_recent[-1].timestamp if closed_recent else None
+
+    if not cache.ltf_primed or latest_closed_ts != cache.ltf_last_closed_ts:
+        full = await market_client.get_ohlcv(
+            symbol, Timeframe.LTF_1H, now - timedelta(days=_LTF_LIVE_FETCH_DAYS), now
+        )
+        if not full:
+            return None
+        cache.closed_ltf_candles = [c for c in full if _is_closed(c, now)]
+        cache.ltf_pivots = detect_pivots(cache.closed_ltf_candles, LTF_PIVOT_LOOKBACK)
+        cache.ltf_last_closed_ts = latest_closed_ts
+        cache.ltf_primed = True
+
+    return recent[-1]
+
+
+async def _refresh_htf_cache(
+    cache: _MarketDataCache, market_client: BingXClient, symbol: str, now: datetime
+) -> bool:
+    """Same reasoning as _refresh_ltf_cache, on the 4h timeframe -- a new
+    close (and therefore a possible trend change) only happens every 4h.
+    Returns False if no data is available at all."""
+    recent = await market_client.get_ohlcv(
+        symbol, Timeframe.HTF_4H, now - timedelta(hours=_HTF_RECENT_WINDOW_HOURS), now
+    )
+    if not recent:
+        return False
+
+    closed_recent = [c for c in recent if _is_closed(c, now, hours=4)]
+    latest_closed_ts = closed_recent[-1].timestamp if closed_recent else None
+
+    if not cache.htf_primed or latest_closed_ts != cache.htf_last_closed_ts:
+        full = await market_client.get_ohlcv(
+            symbol, Timeframe.HTF_4H, now - timedelta(days=HTF_LOOKBACK_BUFFER_DAYS), now
+        )
+        if not full:
+            return False
+        htf_pivots = detect_pivots(
+            [c for c in full if _is_closed(c, now, hours=4)], HTF_PIVOT_LOOKBACK
+        )
+        cache.trend_windows = build_htf_trend_windows(htf_pivots)
+        cache.trend_timestamps = [w.effective_from for w in cache.trend_windows]
+        cache.htf_last_closed_ts = latest_closed_ts
+        cache.htf_primed = True
+
+    return True
+
+
 async def _poll_once(
     state: BotState,
     symbol: str,
@@ -223,32 +328,23 @@ async def _poll_once(
     market_client: BingXClient,
     trade_client: BingXTradeClient,
     notifier: TelegramNotifier,
+    cache: _MarketDataCache,
 ) -> None:
     if state.open_trade is not None:
         await _manage_open_trade(state, symbol, settings, market_client, trade_client, notifier)
         return
 
     now = datetime.now(UTC)
-    htf_candles = await market_client.get_ohlcv(
-        symbol, Timeframe.HTF_4H, now - timedelta(days=HTF_LOOKBACK_BUFFER_DAYS), now
-    )
-    ltf_candles = await market_client.get_ohlcv(
-        symbol, Timeframe.LTF_1H, now - timedelta(days=_LTF_LIVE_FETCH_DAYS), now
-    )
-    if not htf_candles or not ltf_candles:
+    if not await _refresh_htf_cache(cache, market_client, symbol, now):
+        return
+    current_candle = await _refresh_ltf_cache(cache, market_client, symbol, now)
+    if current_candle is None:
         return
 
-    closed_ltf_candles = [c for c in ltf_candles if _is_closed(c, now)]
-    current_candle = ltf_candles[-1]
+    closed_ltf_candles = cache.closed_ltf_candles
+    ltf_pivots = cache.ltf_pivots
 
-    htf_pivots = detect_pivots(
-        [c for c in htf_candles if _is_closed(c, now, hours=4)], HTF_PIVOT_LOOKBACK
-    )
-    ltf_pivots = detect_pivots(closed_ltf_candles, LTF_PIVOT_LOOKBACK)
-    trend_windows = build_htf_trend_windows(htf_pivots)
-    trend_timestamps = [w.effective_from for w in trend_windows]
-
-    window = trend_window_at(trend_windows, trend_timestamps, current_candle.timestamp)
+    window = trend_window_at(cache.trend_windows, cache.trend_timestamps, current_candle.timestamp)
     if window is None:
         return
 
