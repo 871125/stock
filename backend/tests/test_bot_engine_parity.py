@@ -58,6 +58,9 @@ class _FakeTradeClient:
     async def get_available_balance(self, asset: str = "USDT") -> float:
         return self._balance
 
+    async def get_open_position(self, symbol):
+        return None
+
     async def place_market_order(
         self, symbol, side, quantity, reduce_only=False, position_side="BOTH"
     ):

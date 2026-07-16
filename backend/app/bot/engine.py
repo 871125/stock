@@ -59,6 +59,7 @@ from app.services.trading_logic import (
     RSI_PERIOD,
     TP1_CLOSE_FRACTION,
     TREND_TP_HYBRID_MODE,
+    OpenTrade,
     PendingSetup,
     TrendWindow,
     build_htf_trend_windows,
@@ -458,6 +459,31 @@ async def _advance_pending_setup(
     save(state, settings.bot_state_dir)
 
 
+async def _recover_untracked_fill(
+    state: BotState,
+    settings: Settings,
+    symbol: str,
+    decision: OpenTrade,
+    notifier: TelegramNotifier,
+) -> None:
+    """Adopts a position that's already open on the exchange as `decision`'s
+    fill, instead of placing another entry order on top of it. Used when a
+    previous entry attempt's confirmation may have been lost (e.g. a dropped
+    connection while reading place_market_order's response) -- without this,
+    a retry or the next poll would call place_market_order again for the
+    same setup, doubling real position size. entry_order_id is left blank
+    since we never got one; _ensure_protective_orders fills in SL/TP on the
+    next _manage_open_trade poll exactly like any other partially-completed
+    entry (see the matching comment in _execute_trend_entry)."""
+    state.open_trade = LiveOpenTrade(trade=decision, entry_order_id="")
+    state.pending_setup = None
+    save(state, settings.bot_state_dir)
+    await notifier.send(
+        f"⚠️ {symbol} 진입 주문 응답 유실 감지: 거래소에 이미 포지션이 있어 기존 체결을 "
+        f"복구했습니다 (entry={decision.entry_price:.6g}). SL/TP는 다음 폴링에서 자동 복구됩니다."
+    )
+
+
 async def _execute_trend_entry(
     state: BotState,
     symbol: str,
@@ -504,6 +530,24 @@ async def _execute_trend_entry(
 
     side_str = "BUY" if setup.side == PositionSide.LONG else "SELL"
     close_side_str = "SELL" if setup.side == PositionSide.LONG else "BUY"
+
+    # A previous call here for this same setup may have already placed the
+    # entry order without us ever seeing confirmation (e.g. the connection
+    # dropped while reading place_market_order's response) -- retrying
+    # (_poll_once_with_retry) or the next poll would otherwise call
+    # place_market_order again on top of a position that's already open.
+    existing_position = await trade_client.get_open_position(symbol)
+    if existing_position is not None:
+        fill_price = existing_position.entry_price or entry_price_hint
+        decision.entry_price = fill_price
+        decision.stop_loss = stop_loss
+        if decision.take_profit_1 is not None:
+            decision.take_profit_1 = forced_take_profit(setup.side, fill_price, stop_loss)
+        else:
+            decision.take_profit = forced_take_profit(setup.side, fill_price, stop_loss)
+        await _recover_untracked_fill(state, settings, symbol, decision, notifier)
+        return True
+
     try:
         entry_order = await trade_client.place_market_order(symbol, side_str, decision.quantity)
     except BingXAPIError as exc:
@@ -604,6 +648,17 @@ async def _check_box_trade_signal(
 
     side_str = "BUY" if decision.side == PositionSide.LONG else "SELL"
     close_side_str = "SELL" if decision.side == PositionSide.LONG else "BUY"
+
+    # See the matching check in _execute_trend_entry -- a previous call here
+    # may have already placed the entry order without us seeing confirmation.
+    existing_position = await trade_client.get_open_position(symbol)
+    if existing_position is not None:
+        decision.entry_price = existing_position.entry_price or decision.entry_price
+        # Box SL/TP1/TP2 are box-boundary-derived, not entry-price-derived --
+        # no re-derivation needed here either.
+        await _recover_untracked_fill(state, settings, symbol, decision, notifier)
+        return
+
     entry_order = await trade_client.place_market_order(symbol, side_str, decision.quantity)
     fill_price = entry_order.avg_price or decision.entry_price
     decision.entry_price = fill_price
@@ -863,19 +918,31 @@ async def _handle_tp1_fill(
     )
     trade.remaining_fraction -= TP1_CLOSE_FRACTION
     trade.tp1_hit = True
+    trade.stop_loss = trade.entry_price  # breakeven
 
-    if live.sl_order_id:
-        await _cancel_ignoring_errors(trade_client, symbol, live.sl_order_id)
+    # Clear sl_order_id (the old pivot-based SL is about to be canceled) and
+    # persist tp1_hit/stop_loss *before* attempting the replacement SL below --
+    # if that call fails, state/disk must already show "no SL order id" so
+    # _ensure_protective_orders places a correct breakeven-priced one on the
+    # next poll. Otherwise a retry would skip this whole tp1-fill branch
+    # (tp1_hit is already True in memory) while live.sl_order_id still points
+    # at the SL we're about to cancel below, leaving the position with no
+    # stop loss at all until someone notices manually.
+    old_sl_order_id = live.sl_order_id
+    live.sl_order_id = None
+    save(state, settings.bot_state_dir)
+
+    if old_sl_order_id:
+        await _cancel_ignoring_errors(trade_client, symbol, old_sl_order_id)
 
     close_side_str = "SELL" if trade.side == PositionSide.LONG else "BUY"
     remaining_qty = trade.quantity * trade.remaining_fraction
     new_sl_order = await trade_client.place_stop_market_order(
-        symbol, close_side_str, trade.entry_price, remaining_qty
+        symbol, close_side_str, trade.stop_loss, remaining_qty
     )
-    trade.stop_loss = trade.entry_price  # breakeven
     live.sl_order_id = new_sl_order.order_id
-
     save(state, settings.bot_state_dir)
+
     await notifier.send(
         f"\U0001f7e2 TP1 부분청산: {symbol} {partial_qty:.6g} @ "
         f"{trade.take_profit_1:.6g} (SL→본절가 이동)"
