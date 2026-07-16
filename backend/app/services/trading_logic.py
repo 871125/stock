@@ -225,7 +225,7 @@ def try_open_trend_trade(
         leverage=settings.leverage,
         liquidation_buffer_pct=derive_liquidation_buffer_pct(settings.leverage),
     )
-    if sizing.is_liquidation_risk:
+    if sizing.is_liquidation_risk or sizing.is_margin_insufficient:
         return None
 
     return OpenTrade(
@@ -269,7 +269,7 @@ def try_open_hybrid_trend_trade(
         leverage=settings.leverage,
         liquidation_buffer_pct=derive_liquidation_buffer_pct(settings.leverage),
     )
-    if sizing.is_liquidation_risk:
+    if sizing.is_liquidation_risk or sizing.is_margin_insufficient:
         return None
 
     return OpenTrade(
@@ -357,7 +357,7 @@ def try_open_box_trade(
         leverage=settings.leverage,
         liquidation_buffer_pct=derive_liquidation_buffer_pct(settings.leverage),
     )
-    if sizing.is_liquidation_risk:
+    if sizing.is_liquidation_risk or sizing.is_margin_insufficient:
         return None
 
     return OpenTrade(

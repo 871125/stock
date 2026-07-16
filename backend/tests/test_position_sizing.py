@@ -23,6 +23,34 @@ def test_long_position_sizing_matches_spec_formula() -> None:
     assert result.margin_required == pytest.approx(200)
     assert result.quantity == pytest.approx(20)
     assert result.is_liquidation_risk is False
+    assert result.is_margin_insufficient is False
+
+
+def test_flags_margin_insufficient_when_required_margin_exceeds_available_equity() -> None:
+    # A very tight stop (0.05%) blows up position_value/margin_required even
+    # though risk_amount itself stays a modest 1% of equity -- this is the
+    # BingX 110424 "order size must be less than the available amount" case.
+    result = calculate_position_size(
+        equity=10_000,
+        entry_price=100,
+        stop_loss_price=99.95,
+        **DEFAULT_KWARGS,
+    )
+
+    assert result.margin_required > 10_000
+    assert result.is_margin_insufficient is True
+
+
+def test_no_margin_insufficient_when_required_margin_fits_safety_buffer() -> None:
+    result = calculate_position_size(
+        equity=10_000,
+        entry_price=100,
+        stop_loss_price=95,
+        **DEFAULT_KWARGS,
+    )
+
+    assert result.margin_required == pytest.approx(200)
+    assert result.is_margin_insufficient is False
 
 
 def test_short_position_uses_absolute_sl_distance() -> None:

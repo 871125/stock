@@ -14,11 +14,26 @@ is the caller's (backtest_engine / bot).
 `liquidation_buffer_pct` should be derived from leverage (see
 `derive_liquidation_buffer_pct`), not set independently -- otherwise raising
 leverage no longer tightens the liquidation check the way spec 5.3 intends.
+
+The fixed-fractional formula sizes off risk_amount (equity * risk_pct) and
+sl_distance_pct alone -- a tight stop against a large equity can imply
+margin_required beyond `equity` itself, `equity` is never fed back in as a
+ceiling. In live trading `equity` is the account's *available* balance, so
+this isn't hypothetical: it's exactly what produced BingX error 110424
+("order size must be less than the available amount") when a pivot-based
+stop landed close to entry. `is_margin_insufficient` flags that case the same
+way `is_liquidation_risk` does, for callers to skip the trade instead of
+letting the exchange reject the order.
 """
 
 from dataclasses import dataclass
 
 LIQUIDATION_SAFETY_FACTOR = 0.9
+# Leaves headroom below the live-queried available balance for fees/slippage/
+# price drift between sizing and order placement, so we skip trades that
+# would land right on the exchange's rejection boundary instead of bouncing
+# off it and retrying blind on the next poll.
+MARGIN_SAFETY_FACTOR = 0.95
 
 
 def derive_liquidation_buffer_pct(leverage: int) -> float:
@@ -37,6 +52,7 @@ class PositionSizeResult:
     margin_required: float
     quantity: float
     is_liquidation_risk: bool
+    is_margin_insufficient: bool
 
 
 def calculate_position_size(
@@ -71,4 +87,5 @@ def calculate_position_size(
         margin_required=margin_required,
         quantity=quantity,
         is_liquidation_risk=sl_distance_pct > liquidation_buffer_pct,
+        is_margin_insufficient=margin_required > equity * MARGIN_SAFETY_FACTOR,
     )
