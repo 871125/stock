@@ -45,6 +45,7 @@ class BingXAPIError(RuntimeError):
     def __init__(self, code: int, message: str) -> None:
         super().__init__(f"BingX error {code}: {message}")
         self.code = code
+        self.message = message
 
 
 class BingXClient:

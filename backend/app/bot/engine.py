@@ -30,11 +30,14 @@ backward either.
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import httpx
 
 from app.bot.state import BotState, LiveOpenTrade, load, save
 from app.core.config import Settings, get_settings
 from app.schemas.backtest import Candle, PivotPoint, PivotType, PositionSide, Timeframe, TrendState
-from app.services.bingx_client import BingXClient
+from app.services.bingx_client import BingXAPIError, BingXClient
 from app.services.bingx_trade_client import BingXTradeClient
 from app.services.indicators import rsi
 from app.services.pivot import detect_pivots
@@ -69,6 +72,23 @@ from app.services.trading_logic import (
 _LTF_LIVE_FETCH_DAYS = 90
 _FILLED_STATUS = "FILLED"
 
+# BingX-side error codes that are transient (temporary outages on their end,
+# e.g. 109500 "quote service unavailable") rather than a problem with our
+# request -- worth a few quick retries before waking anyone up over Telegram.
+# httpx.TransportError (connection reset mid-read, timeout, DNS blip, etc.) is
+# retried the same way: it's a network-level hiccup, not a code problem, and
+# usually resolves within a few seconds.
+_TRANSIENT_BINGX_CODES = {109500}
+_TRANSIENT_RETRY_ATTEMPTS = 3
+_TRANSIENT_RETRY_BASE_SECONDS = 2.0
+
+_HEARTBEAT_TZ = ZoneInfo("Asia/Seoul")
+_HEARTBEAT_INTERVAL_HOURS = 4
+# Any fixed 09:00 KST instant works as the schedule anchor -- boundaries are
+# every _HEARTBEAT_INTERVAL_HOURS from here in both directions, giving
+# 01:00/05:00/09:00/13:00/17:00/21:00 KST every day.
+_HEARTBEAT_ANCHOR = datetime(2020, 1, 1, 9, 0, tzinfo=_HEARTBEAT_TZ)
+
 
 async def run(symbol: str) -> None:
     settings = get_settings()
@@ -79,13 +99,35 @@ async def run(symbol: str) -> None:
     state = load(settings.bot_state_dir, symbol) or BotState(symbol=symbol)
     await notifier.send(f"\U0001f916 봇 시작: {symbol} (VST={settings.bingx_use_vst})")
 
+    await _ensure_one_way_position_mode(trade_client, notifier)
     await trade_client.set_leverage(symbol, settings.leverage)
     await _reconcile_on_startup(state, symbol, trade_client, notifier)
     save(state, settings.bot_state_dir)
 
+    await asyncio.gather(
+        _poll_loop(state, symbol, settings, market_client, trade_client, notifier),
+        _heartbeat_loop(symbol, notifier),
+    )
+
+
+async def _poll_loop(
+    state: BotState,
+    symbol: str,
+    settings: Settings,
+    market_client: BingXClient,
+    trade_client: BingXTradeClient,
+    notifier: TelegramNotifier,
+) -> None:
     while True:
         try:
-            await _poll_once(state, symbol, settings, market_client, trade_client, notifier)
+            # Re-checked every poll, not just at startup -- the account can
+            # drift back to hedge mode mid-session (e.g. someone touches it
+            # in the BingX app), and every order call after that fails with
+            # 109400 until it's corrected.
+            await _ensure_one_way_position_mode(trade_client, notifier)
+            await _poll_once_with_retry(
+                state, symbol, settings, market_client, trade_client, notifier
+            )
         except Exception as exc:  # noqa: BLE001 -- never let one bad poll kill the bot
             await notifier.send(f"⚠️ 봇 오류: {exc!r}")
 
@@ -95,6 +137,69 @@ async def run(symbol: str) -> None:
             else settings.bot_poll_interval_seconds
         )
         await asyncio.sleep(interval)
+
+
+async def _heartbeat_loop(symbol: str, notifier: TelegramNotifier) -> None:
+    """Sends a "still alive" ping on a fixed schedule (09/13/17/21/01/05 KST),
+    independent of the poll loop and regardless of trading activity -- so a
+    wedged-but-not-crashed process (e.g. hung on a request that never times
+    out) is still noticeable within a few hours even during a quiet market."""
+    while True:
+        now = datetime.now(_HEARTBEAT_TZ)
+        next_run = _next_heartbeat_time(now)
+        await asyncio.sleep((next_run - now).total_seconds())
+        try:
+            await notifier.send(f"✅ 시스템 정상 작동 중: {symbol}")
+        except Exception:  # noqa: BLE001 -- a failed heartbeat must not kill the bot
+            pass
+
+
+def _next_heartbeat_time(now: datetime) -> datetime:
+    interval = timedelta(hours=_HEARTBEAT_INTERVAL_HOURS)
+    slots_passed = (now - _HEARTBEAT_ANCHOR) // interval
+    return _HEARTBEAT_ANCHOR + (slots_passed + 1) * interval
+
+
+async def _ensure_one_way_position_mode(
+    trade_client: BingXTradeClient, notifier: TelegramNotifier
+) -> None:
+    """The bot always sends positionSide="BOTH" (see bingx_trade_client.py's
+    module docstring), which BingX rejects with error 109400 if the account
+    is in hedge mode -- switch it to one-way before anything else runs so
+    that mismatch can't surface mid-trade."""
+    if await trade_client.get_position_mode_is_hedged():
+        await trade_client.set_position_mode_hedged(False)
+        await notifier.send("⚙️ BingX 포지션 모드를 원웨이(One-way)로 전환했습니다.")
+
+
+async def _poll_once_with_retry(
+    state: BotState,
+    symbol: str,
+    settings: Settings,
+    market_client: BingXClient,
+    trade_client: BingXTradeClient,
+    notifier: TelegramNotifier,
+) -> None:
+    """Retry `_poll_once` a few times on known-transient BingX errors and on
+    network-level hiccups (dropped connection, read timeout, etc.).
+
+    A single blip (e.g. code 109500, or an httpx.ReadError from a connection
+    reset) should resolve within a couple of seconds and not page anyone;
+    only exhausting the retries bubbles up to the caller's Telegram
+    notification.
+    """
+    for attempt in range(_TRANSIENT_RETRY_ATTEMPTS + 1):
+        try:
+            await _poll_once(state, symbol, settings, market_client, trade_client, notifier)
+            return
+        except BingXAPIError as exc:
+            if exc.code not in _TRANSIENT_BINGX_CODES or attempt == _TRANSIENT_RETRY_ATTEMPTS:
+                raise
+            await asyncio.sleep(_TRANSIENT_RETRY_BASE_SECONDS * (2**attempt))
+        except httpx.TransportError:
+            if attempt == _TRANSIENT_RETRY_ATTEMPTS:
+                raise
+            await asyncio.sleep(_TRANSIENT_RETRY_BASE_SECONDS * (2**attempt))
 
 
 async def _reconcile_on_startup(
@@ -303,7 +408,21 @@ async def _execute_trend_entry(
 
     side_str = "BUY" if setup.side == PositionSide.LONG else "SELL"
     close_side_str = "SELL" if setup.side == PositionSide.LONG else "BUY"
-    entry_order = await trade_client.place_market_order(symbol, side_str, decision.quantity)
+    try:
+        entry_order = await trade_client.place_market_order(symbol, side_str, decision.quantity)
+    except BingXAPIError as exc:
+        # Our own margin/liquidation checks (position_sizing.py) passed, so the
+        # exchange's own rejection here means something in its live risk
+        # calculation diverges from ours (e.g. an enforced leverage bracket
+        # lower than settings.leverage) -- surface the numbers we used so a
+        # recurrence is diagnosable instead of another guessing game.
+        sl_distance_pct = abs(entry_price_hint - stop_loss) / entry_price_hint
+        raise BingXAPIError(
+            exc.code,
+            f"{exc.message} [qty={decision.quantity:.6g} equity={equity:.2f} "
+            f"entry_hint={entry_price_hint:.6g} sl={stop_loss:.6g} "
+            f"sl_dist%={sl_distance_pct:.4%} leverage={settings.leverage}]",
+        ) from exc
     fill_price = entry_order.avg_price or entry_price_hint
 
     # Re-derive SL/TP against the real fill price -- SL is pivot-based (unaffected),
@@ -312,37 +431,55 @@ async def _execute_trend_entry(
     decision.stop_loss = stop_loss
     live_trade = LiveOpenTrade(trade=decision, entry_order_id=entry_order.order_id)
 
+    # Record the fill immediately, before attempting SL/TP -- if any of those
+    # calls below fails, the position must never end up both untracked (which
+    # would let the bot re-arm and double-enter next poll) and unprotected.
+    # _manage_open_trade's _ensure_protective_orders retries whichever order
+    # didn't make it out here on the very next poll.
+    state.open_trade = live_trade
+    state.pending_setup = None
+    save(state, settings.bot_state_dir)
+
     if decision.take_profit_1 is not None:
         assert decision.take_profit_2 is not None
         tp1_final = forced_take_profit(setup.side, fill_price, stop_loss)
         decision.take_profit_1 = tp1_final
         tp1_qty = decision.quantity * TP1_CLOSE_FRACTION
         tp2_qty = decision.quantity - tp1_qty
+
         sl_order = await trade_client.place_stop_market_order(
             symbol, close_side_str, stop_loss, decision.quantity
         )
+        live_trade.sl_order_id = sl_order.order_id
+        save(state, settings.bot_state_dir)
+
         tp1_order = await trade_client.place_take_profit_market_order(
             symbol, close_side_str, tp1_final, tp1_qty
         )
+        live_trade.tp1_order_id = tp1_order.order_id
+        save(state, settings.bot_state_dir)
+
         tp2_order = await trade_client.place_take_profit_market_order(
             symbol, close_side_str, decision.take_profit_2, tp2_qty
         )
-        live_trade.sl_order_id = sl_order.order_id
-        live_trade.tp1_order_id = tp1_order.order_id
         live_trade.tp2_order_id = tp2_order.order_id
+        save(state, settings.bot_state_dir)
     else:
         tp_final = forced_take_profit(setup.side, fill_price, stop_loss)
         decision.take_profit = tp_final
+
         sl_order = await trade_client.place_stop_market_order(
             symbol, close_side_str, stop_loss, decision.quantity
         )
+        live_trade.sl_order_id = sl_order.order_id
+        save(state, settings.bot_state_dir)
+
         tp_order = await trade_client.place_take_profit_market_order(
             symbol, close_side_str, tp_final, decision.quantity
         )
-        live_trade.sl_order_id = sl_order.order_id
         live_trade.tp_order_id = tp_order.order_id
+        save(state, settings.bot_state_dir)
 
-    state.open_trade = live_trade
     await notifier.send(
         f"✅ 진입: {decision.side.value} {symbol} @ {fill_price:.6g} "
         f"qty={decision.quantity:.6g} SL={decision.stop_loss:.6g}"
@@ -376,32 +513,103 @@ async def _check_box_trade_signal(
     decision.entry_price = fill_price
     # Box SL/TP1/TP2 are box-boundary-derived, not entry-price-derived -- no re-derivation needed.
 
+    # Record the fill immediately, before attempting SL/TP -- see the matching
+    # comment in _execute_trend_entry for why (untracked + unprotected is the
+    # worst outcome if a later order placement call fails).
+    live_trade = LiveOpenTrade(trade=decision, entry_order_id=entry_order.order_id)
+    state.open_trade = live_trade
+    state.pending_setup = None
+    save(state, settings.bot_state_dir)
+
     assert decision.take_profit_1 is not None and decision.take_profit_2 is not None
     tp1_qty = decision.quantity * TP1_CLOSE_FRACTION
     tp2_qty = decision.quantity - tp1_qty
+
     sl_order = await trade_client.place_stop_market_order(
         symbol, close_side_str, decision.stop_loss, decision.quantity
     )
+    live_trade.sl_order_id = sl_order.order_id
+    save(state, settings.bot_state_dir)
+
     tp1_order = await trade_client.place_take_profit_market_order(
         symbol, close_side_str, decision.take_profit_1, tp1_qty
     )
+    live_trade.tp1_order_id = tp1_order.order_id
+    save(state, settings.bot_state_dir)
+
     tp2_order = await trade_client.place_take_profit_market_order(
         symbol, close_side_str, decision.take_profit_2, tp2_qty
     )
-
-    state.open_trade = LiveOpenTrade(
-        trade=decision,
-        entry_order_id=entry_order.order_id,
-        sl_order_id=sl_order.order_id,
-        tp1_order_id=tp1_order.order_id,
-        tp2_order_id=tp2_order.order_id,
-    )
-    state.pending_setup = None
+    live_trade.tp2_order_id = tp2_order.order_id
     save(state, settings.bot_state_dir)
+
     await notifier.send(
         f"✅ 박스권 진입: {decision.side.value} {symbol} @ {fill_price:.6g} "
         f"qty={decision.quantity:.6g}"
     )
+
+
+async def _ensure_protective_orders(
+    state: BotState,
+    symbol: str,
+    settings: Settings,
+    trade_client: BingXTradeClient,
+    notifier: TelegramNotifier,
+) -> None:
+    """Places whichever SL/TP order didn't make it out during entry (the
+    exchange rejected/errored on it after the fill was already recorded --
+    see _execute_trend_entry / _check_box_trade_signal). Runs at the top of
+    every _manage_open_trade poll; a no-op (no network calls) once every
+    expected order id is present."""
+    live = state.open_trade
+    assert live is not None
+    trade = live.trade
+    close_side_str = "SELL" if trade.side == PositionSide.LONG else "BUY"
+    remaining_qty = trade.quantity * trade.remaining_fraction
+    has_two_stage_tp = trade.is_box_trade or trade.take_profit_1 is not None
+    placed_any = False
+
+    if live.sl_order_id is None:
+        sl_order = await trade_client.place_stop_market_order(
+            symbol, close_side_str, trade.stop_loss, remaining_qty
+        )
+        live.sl_order_id = sl_order.order_id
+        placed_any = True
+        save(state, settings.bot_state_dir)
+
+    if has_two_stage_tp:
+        tp1_qty = trade.quantity * TP1_CLOSE_FRACTION
+        tp2_qty = trade.quantity - tp1_qty
+
+        if not trade.tp1_hit and live.tp1_order_id is None:
+            assert trade.take_profit_1 is not None
+            tp1_order = await trade_client.place_take_profit_market_order(
+                symbol, close_side_str, trade.take_profit_1, tp1_qty
+            )
+            live.tp1_order_id = tp1_order.order_id
+            placed_any = True
+            save(state, settings.bot_state_dir)
+
+        if live.tp2_order_id is None:
+            assert trade.take_profit_2 is not None
+            qty = remaining_qty if trade.tp1_hit else tp2_qty
+            tp2_order = await trade_client.place_take_profit_market_order(
+                symbol, close_side_str, trade.take_profit_2, qty
+            )
+            live.tp2_order_id = tp2_order.order_id
+            placed_any = True
+            save(state, settings.bot_state_dir)
+    elif live.tp_order_id is None:
+        assert trade.take_profit is not None
+        tp_order = await trade_client.place_take_profit_market_order(
+            symbol, close_side_str, trade.take_profit, remaining_qty
+        )
+        live.tp_order_id = tp_order.order_id
+        placed_any = True
+        save(state, settings.bot_state_dir)
+
+    if placed_any:
+        await notifier.send(f"\U0001f6e1️ 보호 주문 복구: {symbol} 누락된 SL/TP를 다시 걸었습니다.")
 
 
 async def _manage_open_trade(
@@ -414,6 +622,7 @@ async def _manage_open_trade(
 ) -> None:
     live = state.open_trade
     assert live is not None
+    await _ensure_protective_orders(state, symbol, settings, trade_client, notifier)
     trade = live.trade
     has_two_stage_tp = trade.is_box_trade or trade.take_profit_1 is not None
 
@@ -589,6 +798,22 @@ async def _handle_full_close(
     live = state.open_trade
     assert live is not None
     trade = live.trade
+
+    # An SL/TP order reporting FILLED is a conditional-order trigger, not
+    # proof the resulting close actually executed (e.g. the child market
+    # order can itself fail) -- confirm against the real exchange position
+    # before canceling the sibling order or clearing state, so a false
+    # "filled" reading can't leave a real position both untracked and
+    # unprotected (its other order canceled out from under it).
+    position = await trade_client.get_open_position(symbol)
+    if position is not None:
+        await notifier.send(
+            f"⚠️ 상태 불일치: {symbol} 주문은 체결(FILLED)로 보이는데 거래소에 "
+            f"포지션이 남아있습니다 (qty={position.quantity:.6g}). 자동 종료 처리를 "
+            "건너뛰었습니다 -- 수동 확인 필요."
+        )
+        return
+
     remaining_qty = trade.quantity * trade.remaining_fraction
     pnl = signed_pnl(trade.side, trade.entry_price, exit_price, remaining_qty)
     total_pnl = trade.realized_pnl + pnl
